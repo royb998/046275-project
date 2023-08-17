@@ -40,6 +40,7 @@ typedef struct
 std::map<ADDRINT, LOOP_DATA> loops;
 std::map<ADDRINT, UINT64> rtn_ins_counts;
 map<ADDRINT, UINT64> rtn_call_counts;
+map<ADDRINT, map<ADDRINT, UINT64>> caller_count;
 
 /* ===================================================================== */
 /*Call functions*/
@@ -135,6 +136,20 @@ VOID Trace(TRACE trace, VOID* v)
                 }
             }
         }
+
+        if (INS_IsCall(ins_tail) && INS_IsDirectControlFlow(ins_tail)) {
+            // Get the target address of the call
+            ADDRINT targetAddr = INS_DirectControlFlowTargetAddress(ins_tail);
+
+            if (caller_count.count(targetAddr) == 0 || caller_count[targetAddr].count(ins_tail_addr) == 0)
+            {
+                caller_count[targetAddr][ins_tail_addr] = 1;
+            }
+            else
+            {
+                caller_count[targetAddr][ins_tail_addr]++;
+            }
+        }
     }
 }
 
@@ -199,6 +214,18 @@ VOID Fini(INT32 code, VOID* v)
     {
         if (it->second.count_seen > 0 && it->second.count_invoked > 0)
         {
+            ADDRINT max_caller = 0;
+            UINT64 max_calls = 0;
+            for (auto iter = caller_count[it->second.rtn_addr].begin();
+                 iter != caller_count[it->second.rtn_addr].end(); ++iter)
+            {
+                if (max_calls < iter->second)
+                {
+                    max_caller = iter->first;
+                    max_calls = iter->second;
+                }
+            }
+
             to << "0x" << std::hex << it->second.loop_target_addr << ", "
                << std::dec << it->second.count_seen << ", "
                << it->second.count_invoked << ", "
@@ -207,7 +234,9 @@ VOID Fini(INT32 code, VOID* v)
                << it->second.rtn_name << ", "
                << "0x" << std::hex << it->second.rtn_addr << ", "
                << std::dec << rtn_ins_counts[it->second.rtn_addr] << ", "
-               << std::dec << rtn_call_counts[it->second.rtn_addr] << endl;
+               << std::dec << rtn_ins_counts[it->second.rtn_addr] << ", "
+               << "0x" << std::hex << max_caller << ", "
+               << std::dec << max_calls << endl;
         }
     }
     to.close();
