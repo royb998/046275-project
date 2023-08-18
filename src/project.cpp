@@ -147,12 +147,96 @@ VOID instrument_routine(RTN rtn, VOID* v)
 }
 
 /* ===================================================================== */
+/* Function Inlining                                                     */
+/* ===================================================================== */
+
+BOOL is_valid_for_inlining(RTN rtn)
+{
+    BOOL return_value = true;
+    BOOL has_ret = false;
+
+    ADDRINT start_addr;
+    INS last_ins;
+    ADDRINT end_addr;
+
+    ADDRINT target_addr;
+
+    RTN_Open(rtn);
+
+    start_addr = RTN_Address(rtn);
+
+    last_ins = RTN_InsTail(rtn);
+    if (!INS_IsRet(last_ins))
+    {
+        return_value = false;
+        goto l_cleanup;
+    }
+
+    end_addr = INS_Address(last_ins);
+
+    for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins))
+    {
+        // Do not inline functions that have more than one ret instructions.
+        if (INS_IsRet(ins))
+        {
+            if (has_ret)
+            {
+                return_value = false;
+                goto l_cleanup;
+            }
+
+            has_ret = true;
+        }
+
+        // Do not inline functions with indirect calls/jumps.
+        if (INS_IsIndirectControlFlow(ins))
+        {
+            return_value = false;
+            goto l_cleanup;
+        }
+
+        // Do not inline functions that jumps outside of its own scope.
+        if (INS_IsBranch(ins))
+        {
+            target_addr = INS_DirectControlFlowTargetAddress(ins);
+            if (target_addr < start_addr || target_addr > end_addr)
+            {
+                return_value = false;
+                goto l_cleanup;
+            }
+        }
+
+        // Do not inline functions with invalid r[sb]p offsets.
+        for (UINT32 memOpIndex = 0; memOpIndex < INS_MemoryOperandCount(ins); ++memOpIndex)
+        {
+            if (INS_MemoryOperandIsRead(ins, memOpIndex) ||
+                INS_MemoryOperandIsWritten(ins, memOpIndex))
+            {
+                REG base_reg = INS_OperandMemoryBaseReg(ins, memOpIndex);
+                ADDRDELTA displacement = INS_OperandMemoryDisplacement(ins, memOpIndex);
+
+                if ((base_reg == REG_RSP && displacement < 0) ||
+                    (base_reg == REG_RBP && displacement >= 0))
+                {
+                    return_value = false;
+                    goto l_cleanup;
+                }
+            }
+        }
+    }
+
+l_cleanup:
+    RTN_Close(rtn);
+    return return_value;
+}
+
+/* ===================================================================== */
 /* Configuration                                                         */
 /* ===================================================================== */
 
-
 KNOB <BOOL> prof_mode(KNOB_MODE_WRITEONCE, "pintool", "prof", "0",
                       "Run in profile mode");
+
 KNOB <BOOL> opt_mode(KNOB_MODE_WRITEONCE, "pintool", "opt", "0",
                       "Run in optimization mode");
 
