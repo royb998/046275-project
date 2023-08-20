@@ -150,9 +150,9 @@ VOID instrument_routine(RTN rtn, VOID* v)
 /* Function Inlining                                                     */
 /* ===================================================================== */
 
-BOOL is_valid_for_inlining(RTN rtn)
+int is_valid_for_inlining(RTN rtn)
 {
-    BOOL return_value = true;
+    int return_value = 0;
     BOOL has_ret = false;
 
     ADDRINT start_addr;
@@ -168,7 +168,7 @@ BOOL is_valid_for_inlining(RTN rtn)
     last_ins = RTN_InsTail(rtn);
     if (!INS_IsRet(last_ins))
     {
-        return_value = false;
+        return_value = 1;
         goto l_cleanup;
     }
 
@@ -181,17 +181,16 @@ BOOL is_valid_for_inlining(RTN rtn)
         {
             if (has_ret)
             {
-                return_value = false;
+                return_value = 2;
                 goto l_cleanup;
             }
 
             has_ret = true;
         }
-
         // Do not inline functions with indirect calls/jumps.
-        if (INS_IsIndirectControlFlow(ins))
+        else if (INS_IsIndirectControlFlow(ins))
         {
-            return_value = false;
+            return_value = 3;
             goto l_cleanup;
         }
 
@@ -201,7 +200,7 @@ BOOL is_valid_for_inlining(RTN rtn)
             target_addr = INS_DirectControlFlowTargetAddress(ins);
             if (target_addr < start_addr || target_addr > end_addr)
             {
-                return_value = false;
+                return_value = 4;
                 goto l_cleanup;
             }
         }
@@ -216,9 +215,9 @@ BOOL is_valid_for_inlining(RTN rtn)
                 ADDRDELTA displacement = INS_OperandMemoryDisplacement(ins, memOpIndex);
 
                 if ((base_reg == REG_RSP && displacement < 0) ||
-                    (base_reg == REG_RBP && displacement >= 0))
+                    (base_reg == REG_RBP && displacement > 0))
                 {
-                    return_value = false;
+                    return_value = 5;
                     goto l_cleanup;
                 }
             }
@@ -228,6 +227,67 @@ BOOL is_valid_for_inlining(RTN rtn)
 l_cleanup:
     RTN_Close(rtn);
     return return_value;
+}
+
+/* ===================================================================== */
+/* Main translation routine                                              */
+/* ===================================================================== */
+
+// TODO: Very partial; rework later to consider relevant functions only.
+int find_inlining_candidates(IMG img)
+{
+    int return_value = 0;
+
+    cout << "==========" << endl;
+    cout << "Finding candidates" << endl;
+
+    for (SEC sec = IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec))
+    {
+        if (!SEC_IsExecutable(sec) || SEC_IsWriteable(sec) || !SEC_Address(sec))
+        {
+            continue;
+        }
+
+        for (RTN rtn = SEC_RtnHead(sec); RTN_Valid(rtn); rtn = RTN_Next(rtn))
+        {
+            if (rtn == RTN_Invalid())
+            {
+                cerr << "Zut. wtf" << endl;
+            } // TODO
+
+            cout << RTN_Name(rtn) << " : ";
+
+            return_value = is_valid_for_inlining(rtn);
+            if (return_value != 0)
+            {
+                cout << "in";
+            }
+            cout << "valid for inlining " << return_value << endl;
+        }
+    }
+
+    cout << "==========" << endl;
+
+// l_cleanup:
+    return return_value;
+}
+
+VOID ImageLoad(IMG img, VOID * v)
+{
+    int return_value = 0;
+
+    // Only translate for main image.
+    if (!IMG_IsMainExecutable(img))
+    {
+        return;
+    }
+
+    // Find candidates for inlining.
+    return_value = find_inlining_candidates(img);
+    if (return_value != 0)
+    {
+        return;
+    }
 }
 
 /* ===================================================================== */
@@ -318,6 +378,13 @@ int main(int argc, char* argv[])
 
         // Never returns
         PIN_StartProgram();
+    }
+    if (opt_mode)
+    {
+        IMG_AddInstrumentFunction(ImageLoad, 0);
+
+        // Never returns.
+        PIN_StartProgramProbed();
     }
     else
     {
