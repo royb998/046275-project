@@ -18,6 +18,12 @@ using std::map;
 using std::ofstream;
 
 /* ===================================================================== */
+/* Constants                                                             */
+/* ===================================================================== */
+
+const float HOT_CALL_THRESH = 0.9;
+
+/* ===================================================================== */
 /* LOOP data conatainer, */
 /* ===================================================================== */
 
@@ -40,6 +46,7 @@ typedef struct
 std::map<ADDRINT, LOOP_DATA> loops;
 std::map<ADDRINT, UINT64> rtn_ins_counts;
 map<ADDRINT, UINT64> rtn_call_counts;
+map<ADDRINT, map<ADDRINT, UINT64>> caller_count;
 
 /* ===================================================================== */
 /*Call functions*/
@@ -78,6 +85,11 @@ VOID count_rtn_call(ADDRINT addr)
     rtn_call_counts[addr]++;
 }
 
+VOID count_call(ADDRINT target_addr, ADDRINT src_addr)
+{
+    caller_count[target_addr][src_addr]++;
+}
+
 /* ===================================================================== */
 
 VOID Trace(TRACE trace, VOID* v)
@@ -86,6 +98,7 @@ VOID Trace(TRACE trace, VOID* v)
     INS ins_tail = BBL_InsTail(bbl);
     ADDRINT ins_tail_addr = INS_Address(ins_tail);
     RTN curr_rtn = TRACE_Rtn(trace);
+    ADDRINT target_addr;
 
     if (!RTN_Valid(curr_rtn))
     {
@@ -121,7 +134,7 @@ VOID Trace(TRACE trace, VOID* v)
         {
             if (INS_IsDirectBranch(ins_tail))
             {
-                ADDRINT target_addr = INS_DirectControlFlowTargetAddress(ins_tail);
+                target_addr = INS_DirectControlFlowTargetAddress(ins_tail);
 
                 if (target_addr < ins_tail_addr)
                 {
@@ -134,6 +147,17 @@ VOID Trace(TRACE trace, VOID* v)
                                    IARG_BRANCH_TAKEN, IARG_END);
                 }
             }
+        }
+
+        if (INS_IsDirectCall(ins_tail)) {
+            // Get the target address of the call
+            target_addr = INS_DirectControlFlowTargetAddress(ins_tail);
+            caller_count[target_addr][ins_tail_addr] = 0;
+
+            INS_InsertCall(ins_tail, IPOINT_BEFORE, (AFUNPTR)count_call,
+                           IARG_ADDRINT, target_addr,
+                           IARG_ADDRINT, ins_tail_addr,
+                           IARG_END);
         }
     }
 }
@@ -341,17 +365,41 @@ VOID Fini(INT32 code, VOID* v)
 
     for (std::multimap<UINT32, LOOP_DATA>::const_iterator it = sorted_loops_map.begin(); it != sorted_loops_map.end(); ++it)
     {
+        ADDRINT rtn_address = it->second.rtn_addr;
+
         if (it->second.count_seen > 0 && it->second.count_invoked > 0)
         {
-            to << "0x" << std::hex << it->second.loop_target_addr << ", "
-               << std::dec << it->second.count_seen << ", "
-               << it->second.count_invoked << ", "
-               << std::dec << it->second.count_seen / (double)it->second.count_invoked << ", "
-               << it->second.diff_count << ", "
-               << it->second.rtn_name << ", "
-               << "0x" << std::hex << it->second.rtn_addr << ", "
-               << std::dec << rtn_ins_counts[it->second.rtn_addr] << ", "
-               << std::dec << rtn_call_counts[it->second.rtn_addr] << endl;
+            ADDRINT max_caller = 0;
+            UINT64 max_calls = 0;
+            for (auto iter = caller_count[rtn_address].begin();
+                 iter != caller_count[rtn_address].end(); ++iter)
+            {
+                UINT64 current_count = iter->second;
+
+                if ((float)current_count / rtn_call_counts[rtn_address] < HOT_CALL_THRESH)
+                {
+                    continue;
+                }
+
+                if (max_calls < current_count)
+                {
+                    max_caller = iter->first;
+                    max_calls = current_count;
+                }
+            }
+
+            to << "0x" << std::hex << it->second.loop_target_addr
+               << ", " << std::dec << it->second.count_seen
+               << ", " << it->second.count_invoked
+               << ", " << std::dec << it->second.count_seen / (double)it->second.count_invoked
+               << ", " << it->second.diff_count
+               << ", " << it->second.rtn_name
+               << ", " << "0x" << std::hex << rtn_address
+               << ", " << std::dec << rtn_ins_counts[rtn_address]
+               << ", " << std::dec << rtn_call_counts[rtn_address]
+               << ", " << "0x" << std::hex << max_caller
+               << ", " << std::dec << max_calls
+               << endl;
         }
     }
     to.close();
