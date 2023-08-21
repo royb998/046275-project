@@ -60,6 +60,7 @@ std::map<ADDRINT, UINT64> rtn_ins_counts;
 map<ADDRINT, UINT64> rtn_call_counts;
 map<ADDRINT, map<ADDRINT, UINT64>> caller_count;
 map<ADDRINT, ADDRINT> rtn_callers;
+std::vector<std::pair<ADDRINT, ADDRINT>> inlining_candidates;
 
 // For XED:
 #if defined(TARGET_IA32E)
@@ -1060,8 +1061,8 @@ l_cleanup:
 
 int find_inlining_candidates()
 {
+    int return_value = -1;
     RTN rtn;
-    std::vector<std::pair<ADDRINT, ADDRINT>> candidates;
 
     for (const auto &pair : rtn_callers)
     {
@@ -1079,104 +1080,18 @@ int find_inlining_candidates()
             cout << "Zut. rc " << rc << " " << endl; // TODO
         }
 
-        candidates.push_back(pair);
+        inlining_candidates.push_back(pair);
+        return_value = 0;
 
         cout << std::hex << pair.first << " " << pair.second << " valid" << endl; // TODO
     }
 
-    return 0;
+    return return_value;
 }
 
 /* ===================================================================== */
 /* Main translation routine                                              */
 /* ===================================================================== */
-
-int find_candidate_rtns_for_translation(IMG img)
-{
-    int rc;
-
-    // go over routines and check if they are candidates for translation and mark them for translation:
-
-    for (SEC sec = IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec))
-    {
-        if (!SEC_IsExecutable(sec) || SEC_IsWriteable(sec) || !SEC_Address(sec))
-        {
-            continue;
-        }
-
-        for (RTN rtn = SEC_RtnHead(sec); RTN_Valid(rtn); rtn = RTN_Next(rtn))
-        {
-
-            if (rtn == RTN_Invalid())
-            {
-                cerr << "Warning: invalid routine " << RTN_Name(rtn) << endl;
-                continue;
-            }
-
-            translated_rtn[translated_rtn_num].rtn_addr = RTN_Address(rtn);
-            translated_rtn[translated_rtn_num].rtn_size = RTN_Size(rtn);
-            translated_rtn[translated_rtn_num].instr_map_entry = num_of_instr_map_entries;
-            translated_rtn[translated_rtn_num].isSafeForReplacedProbe = true;
-
-            // Open the RTN.
-            RTN_Open(rtn);
-
-            for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins))
-            {
-
-                //debug print of orig instruction:
-                if (KnobVerbose)
-                {
-                    cerr << "old instr: ";
-                    cerr << "0x" << hex << INS_Address(ins) << ": " << INS_Disassemble(ins) << endl;
-                    //xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address (ins)), INS_Size(ins));
-                }
-
-                ADDRINT addr = INS_Address(ins);
-
-                xed_decoded_inst_t xedd;
-                xed_error_enum_t xed_code;
-
-                xed_decoded_inst_zero_set_mode(&xedd, &dstate);
-
-                xed_code = xed_decode(&xedd, reinterpret_cast<UINT8 *>(addr), max_inst_len);
-                if (xed_code != XED_ERROR_NONE)
-                {
-                    cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << addr << endl;
-                    translated_rtn[translated_rtn_num].instr_map_entry = -1;
-                    break;
-                }
-
-                // Add instr into instr map:
-                rc = add_new_instr_entry(&xedd, INS_Address(ins), INS_Size(ins));
-                if (rc < 0)
-                {
-                    cerr << "ERROR: failed during instructon translation." << endl;
-                    translated_rtn[translated_rtn_num].instr_map_entry = -1;
-                    break;
-                }
-            } // end for INS...
-
-
-            // debug print of routine name:
-            if (KnobVerbose)
-            {
-                cerr << "rtn name: " << RTN_Name(rtn) << " : " << dec << translated_rtn_num << endl;
-            }
-
-
-            // Close the RTN.
-            RTN_Close(rtn);
-
-            translated_rtn_num++;
-
-        } // end for RTN..
-    } // end for SEC...
-
-
-    return 0;
-}
-
 
 void load_profiled_candidates()
 {
@@ -1215,9 +1130,96 @@ void load_profiled_candidates()
     }
 }
 
+int find_candidate_rtns_for_translation(IMG img)
+{
+    int rc;
+    RTN rtn;
+
+    // Find candidates for inlining.
+    load_profiled_candidates();
+    rc = find_inlining_candidates();
+    if (rc != 0)
+    {
+        return rc;
+    }
+
+    // go over routines and check if they are candidates for translation and mark them for translation:
+
+    for (const auto &pair : inlining_candidates)
+    {
+        rtn = RTN_FindByAddress(pair.second);
+
+        if (rtn == RTN_Invalid())
+        {
+            cerr << "Warning: invalid routine " << RTN_Name(rtn) << endl;
+            continue;
+        }
+
+        translated_rtn[translated_rtn_num].rtn_addr = RTN_Address(rtn);
+        translated_rtn[translated_rtn_num].rtn_size = RTN_Size(rtn);
+        translated_rtn[translated_rtn_num].instr_map_entry = num_of_instr_map_entries;
+        translated_rtn[translated_rtn_num].isSafeForReplacedProbe = true;
+
+        // Open the RTN.
+        RTN_Open(rtn);
+
+        for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins))
+        {
+
+            //debug print of orig instruction:
+            if (KnobVerbose)
+            {
+                cerr << "old instr: ";
+                cerr << "0x" << hex << INS_Address(ins) << ": " << INS_Disassemble(ins) << endl;
+                //xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address (ins)), INS_Size(ins));
+            }
+
+            ADDRINT addr = INS_Address(ins);
+
+            xed_decoded_inst_t xedd;
+            xed_error_enum_t xed_code;
+
+            xed_decoded_inst_zero_set_mode(&xedd, &dstate);
+
+            xed_code = xed_decode(&xedd, reinterpret_cast<UINT8 *>(addr), max_inst_len);
+            if (xed_code != XED_ERROR_NONE)
+            {
+                cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << addr << endl;
+                translated_rtn[translated_rtn_num].instr_map_entry = -1;
+                break;
+            }
+
+            // Add instr into instr map:
+            rc = add_new_instr_entry(&xedd, INS_Address(ins), INS_Size(ins));
+            if (rc < 0)
+            {
+                cerr << "ERROR: failed during instructon translation." << endl;
+                translated_rtn[translated_rtn_num].instr_map_entry = -1;
+                break;
+            }
+        } // end for INS...
+
+
+        // debug print of routine name:
+        if (KnobVerbose)
+        {
+            cerr << "rtn name: " << RTN_Name(rtn) << " : " << dec << translated_rtn_num << endl;
+        }
+
+
+        // Close the RTN.
+        RTN_Close(rtn);
+
+        translated_rtn_num++;
+    } // end for RTN..
+
+
+    return 0;
+}
+
 VOID ImageLoad(IMG img, VOID * v)
 {
-    int return_value = 0;
+    int rc = 0;
 
     // Only translate for main image.
     if (!IMG_IsMainExecutable(img))
@@ -1227,12 +1229,56 @@ VOID ImageLoad(IMG img, VOID * v)
 
     main_image_addr = IMG_EntryAddress(img);
 
-    // Find candidates for inlining.
-    load_profiled_candidates();
-    return_value = find_inlining_candidates();
-    if (return_value != 0)
-    {
+    // step 1: Check size of executable sections and allocate required memory:
+    rc = allocate_and_init_memory(img);
+    if (rc < 0)
         return;
+
+    cout << "after memory allocation" << endl;
+
+    // Step 2: go over all routines and identify candidate routines and copy their code into the instr map IR:
+    rc = find_candidate_rtns_for_translation(img);
+    if (rc < 0)
+        return;
+
+    cout << "after identifying candidate routines" << endl;
+
+    // Step 3: Chaining - calculate direct branch and call instructions to point to corresponding target instr entries:
+    rc = chain_all_direct_br_and_call_target_entries();
+    if (rc < 0 )
+        return;
+
+    cout << "after calculate direct br targets" << endl;
+
+    // Step 4: fix rip-based, direct branch and direct call displacements:
+    rc = fix_instructions_displacements();
+    if (rc < 0 )
+        return;
+
+    cout << "after fix instructions displacements" << endl;
+
+
+    // Step 5: write translated routines to new tc:
+    rc = copy_instrs_to_tc();
+    if (rc < 0 )
+        return;
+
+    cout << "after write all new instructions to memory tc" << endl;
+
+   if (KnobDumpTranslatedCode) {
+       cerr << "Translation Cache dump:" << endl;
+       dump_tc();  // dump the entire tc
+
+       cerr << endl << "instructions map dump:" << endl;
+       dump_entire_instr_map();     // dump all translated instructions in map_instr
+   }
+
+
+    // Step 6: Commit the translated routines:
+    //Go over the candidate functions and replace the original ones by their new successfully translated ones:
+    if (!KnobDoNotCommitTranslatedCode) {
+      commit_translated_routines();
+      cout << "after commit translated routines" << endl;
     }
 }
 
