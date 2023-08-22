@@ -36,6 +36,7 @@ using std::ofstream;
 /* ===================================================================== */
 
 const float HOT_CALL_THRESH = 0.9;
+const int HOT_CALL_MIN_COUNT = 2;
 
 const std::string count_file = "loop-count.csv";
 
@@ -1415,7 +1416,8 @@ VOID Fini(INT32 code, VOID* v)
             {
                 UINT64 current_count = iter->second;
 
-                if ((float)current_count / rtn_call_counts[rtn_address] < HOT_CALL_THRESH)
+                if ((current_count < HOT_CALL_MIN_COUNT) ||
+                    ((float)current_count / rtn_call_counts[rtn_address] < HOT_CALL_THRESH))
                 {
                     continue;
                 }
