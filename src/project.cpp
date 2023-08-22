@@ -60,7 +60,7 @@ std::map<ADDRINT, UINT64> rtn_ins_counts;
 map<ADDRINT, UINT64> rtn_call_counts;
 map<ADDRINT, map<ADDRINT, UINT64>> caller_count;
 map<ADDRINT, ADDRINT> rtn_callers;
-std::vector<std::pair<ADDRINT, ADDRINT>> inlining_candidates;
+std::map<ADDRINT, ADDRINT> inlining_candidates;
 
 // For XED:
 #if defined(TARGET_IA32E)
@@ -427,6 +427,185 @@ VOID instrument_routine(RTN rtn, VOID* v)
     RTN_Close(rtn);
 }
 
+/* ===================================================================== */
+/* Function Inlining                                                     */
+/* ===================================================================== */
+
+int is_valid_for_inlining(RTN rtn)
+{
+    int return_value = 0;
+    BOOL has_ret = false;
+
+    ADDRINT start_addr;
+    INS last_ins;
+    ADDRINT end_addr;
+
+    ADDRINT target_addr;
+
+    RTN_Open(rtn);
+
+    start_addr = RTN_Address(rtn);
+
+    last_ins = RTN_InsTail(rtn);
+    if (!INS_IsRet(last_ins))
+    {
+        return_value = 1;
+        goto l_cleanup;
+    }
+
+    end_addr = INS_Address(last_ins);
+
+    for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins))
+    {
+        // Do not inline functions that have more than one ret instructions.
+        if (INS_IsRet(ins))
+        {
+            if (has_ret)
+            {
+                return_value = 2;
+                goto l_cleanup;
+            }
+
+            has_ret = true;
+        }
+        // Do not inline functions with indirect calls/jumps.
+        else if (INS_IsIndirectControlFlow(ins))
+        {
+            return_value = 3;
+            goto l_cleanup;
+        }
+
+        // Do not inline functions that jumps outside of its own scope.
+        if (INS_IsBranch(ins))
+        {
+            target_addr = INS_DirectControlFlowTargetAddress(ins);
+            if (target_addr < start_addr || target_addr > end_addr)
+            {
+                return_value = 4;
+                goto l_cleanup;
+            }
+        }
+
+        // Do not inline functions with invalid r[sb]p offsets.
+        for (UINT32 memOpIndex = 0; memOpIndex < INS_MemoryOperandCount(ins); ++memOpIndex)
+        {
+            if (INS_MemoryOperandIsRead(ins, memOpIndex) ||
+                INS_MemoryOperandIsWritten(ins, memOpIndex))
+            {
+                REG base_reg = INS_OperandMemoryBaseReg(ins, memOpIndex);
+                ADDRDELTA displacement = INS_OperandMemoryDisplacement(ins, memOpIndex);
+
+                if ((base_reg == REG_RSP && displacement < 0) ||
+                    (base_reg == REG_RBP && displacement > 0))
+                {
+                    return_value = 5;
+                    goto l_cleanup;
+                }
+            }
+        }
+    }
+
+l_cleanup:
+    RTN_Close(rtn);
+    return return_value;
+}
+
+int find_inlining_candidates()
+{
+    int return_value = -1;
+    RTN rtn;
+
+    for (const auto &pair : rtn_callers)
+    {
+        rtn = RTN_FindByAddress(pair.first);
+
+        if (!RTN_Valid(rtn))
+        {
+            cout << "Zut. Invalid. " << endl; // TODO
+            continue;
+        }
+
+        int rc = is_valid_for_inlining(rtn);
+        if (rc != 0)
+        {
+            cout << "Zut. rc " << rc << " " << endl; // TODO
+        }
+
+        // inlining_candidates.push_back(pair);
+        inlining_candidates[pair.first] = pair.second;
+        return_value = 0;
+
+        cout << std::hex << pair.first << " " << pair.second << " valid" << endl; // TODO
+    }
+
+    return return_value;
+}
+
+int inline_routine(ADDRINT rtn_address, int cursor)
+{
+    INS ins;
+    char inst_bytes[XED_MAX_INSTRUCTION_BYTES] = { 0 };
+    xed_error_enum_t xed_error;
+    unsigned int size;
+
+    int success_count = 0; // TODO
+
+    RTN rtn = RTN_FindByAddress(rtn_address);
+
+    if (!RTN_Valid(rtn))
+    {
+        cout << "Zut. Invalid rtn for inline at 0x" << std::hex
+             << rtn_address << endl;
+        cursor = -1;
+        goto l_cleanup;
+    }
+
+    RTN_Open(rtn);
+
+    ins = RTN_InsHead(rtn);
+
+    while (!INS_IsRet(ins))
+    {
+        if (!INS_Valid(ins))
+        {
+            cout << "Zut. Invalid instruction at inlined rtn at 0x" << std::hex
+                 << rtn_address << endl;
+            cursor = -1;
+            goto l_cleanup;
+        }
+        xed_decoded_inst_t * xed_inst = INS_XedDec(ins);
+
+        // Converts the decoder request to a valid encoder request:
+        xed_encoder_request_init_from_decode (xed_inst);
+
+        xed_error = xed_encode(xed_inst,
+                               (UINT8*)inst_bytes,
+                               XED_MAX_INSTRUCTION_BYTES,
+                               &size);
+        if (xed_error != XED_ERROR_NONE) {
+            cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;
+            cerr << "Managed to encode " << success_count << endl;
+            for (int i = 0; i < XED_MAX_INSTRUCTION_BYTES; ++i)
+            {
+                cout << " " << std::hex << inst_bytes[i];
+            }
+            cout << endl;
+            cursor = -1;
+            goto l_cleanup;
+        }
+
+        memcpy(&tc[cursor], &inst_bytes, size);
+        cursor += size;
+
+        success_count++;
+        ins = INS_Next(ins);
+    }
+
+l_cleanup:
+    RTN_Close(rtn);
+    return cursor;
+}
+
 /* ============================================================= */
 /* Translation routines                                         */
 /* ============================================================= */
@@ -456,7 +635,10 @@ int add_new_instr_entry(xed_decoded_inst_t *xedd, ADDRINT pc, unsigned int size)
 
     unsigned int new_size = 0;
 
-    xed_error_enum_t xed_error = xed_encode (xedd, reinterpret_cast<UINT8*>(instr_map[num_of_instr_map_entries].encoded_ins), max_inst_len , &new_size);
+    xed_error_enum_t xed_error = xed_encode(
+        xedd,
+        reinterpret_cast<UINT8*>(instr_map[num_of_instr_map_entries].encoded_ins),
+        max_inst_len , &new_size);
     if (xed_error != XED_ERROR_NONE) {
         cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;
         return -1;
@@ -850,16 +1032,35 @@ int copy_instrs_to_tc()
     int cursor = 0;
 
     for (int i=0; i < num_of_instr_map_entries; i++) {
+        /*if ((ADDRINT)&tc[cursor] != instr_map[i].new_ins_addr) {
+            cerr << "ERROR: Non-matching instruction addresses: " << hex
+                 << (ADDRINT)&tc[cursor] << " vs. " << instr_map[i].new_ins_addr
+                 << endl;
+            return -1;
+        }*/
 
-      if ((ADDRINT)&tc[cursor] != instr_map[i].new_ins_addr) {
-          cerr << "ERROR: Non-matching instruction addresses: " << hex << (ADDRINT)&tc[cursor] << " vs. " << instr_map[i].new_ins_addr << endl;
-          return -1;
-      }
-
-      memcpy(&tc[cursor], &instr_map[i].encoded_ins, instr_map[i].size);
-
-      cursor += instr_map[i].size;
+        if ((XED_CATEGORY_CALL == instr_map[i].category_enum) &&
+            (inlining_candidates.count(instr_map[i].orig_targ_addr) > 0) &&
+            (instr_map[i].orig_ins_addr == inlining_candidates[instr_map[i].orig_targ_addr]))
+        {
+            cout << "Yay! might inline " << std::hex << instr_map[i].orig_ins_addr << endl;
+            cursor = inline_routine(instr_map[i].orig_targ_addr, cursor);
+            if (cursor < 0)
+            {
+                cout << "ERROR: Failed to inline function at 0x" <<
+                     std::hex << instr_map[i].orig_targ_addr << endl;
+                return -1;
+            }
+        }
+        else
+        {
+            instr_map[i].new_ins_addr = (ADDRINT)&tc[cursor];
+            memcpy(&tc[cursor], &instr_map[i].encoded_ins, instr_map[i].size);
+            cursor += instr_map[i].size;
+        }
     }
+
+    tc_cursor = cursor;
 
     return 0;
 }
@@ -977,119 +1178,6 @@ int allocate_and_init_memory(IMG img)
 }
 
 /* ===================================================================== */
-/* Function Inlining                                                     */
-/* ===================================================================== */
-
-int is_valid_for_inlining(RTN rtn)
-{
-    int return_value = 0;
-    BOOL has_ret = false;
-
-    ADDRINT start_addr;
-    INS last_ins;
-    ADDRINT end_addr;
-
-    ADDRINT target_addr;
-
-    RTN_Open(rtn);
-
-    start_addr = RTN_Address(rtn);
-
-    last_ins = RTN_InsTail(rtn);
-    if (!INS_IsRet(last_ins))
-    {
-        return_value = 1;
-        goto l_cleanup;
-    }
-
-    end_addr = INS_Address(last_ins);
-
-    for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins))
-    {
-        // Do not inline functions that have more than one ret instructions.
-        if (INS_IsRet(ins))
-        {
-            if (has_ret)
-            {
-                return_value = 2;
-                goto l_cleanup;
-            }
-
-            has_ret = true;
-        }
-        // Do not inline functions with indirect calls/jumps.
-        else if (INS_IsIndirectControlFlow(ins))
-        {
-            return_value = 3;
-            goto l_cleanup;
-        }
-
-        // Do not inline functions that jumps outside of its own scope.
-        if (INS_IsBranch(ins))
-        {
-            target_addr = INS_DirectControlFlowTargetAddress(ins);
-            if (target_addr < start_addr || target_addr > end_addr)
-            {
-                return_value = 4;
-                goto l_cleanup;
-            }
-        }
-
-        // Do not inline functions with invalid r[sb]p offsets.
-        for (UINT32 memOpIndex = 0; memOpIndex < INS_MemoryOperandCount(ins); ++memOpIndex)
-        {
-            if (INS_MemoryOperandIsRead(ins, memOpIndex) ||
-                INS_MemoryOperandIsWritten(ins, memOpIndex))
-            {
-                REG base_reg = INS_OperandMemoryBaseReg(ins, memOpIndex);
-                ADDRDELTA displacement = INS_OperandMemoryDisplacement(ins, memOpIndex);
-
-                if ((base_reg == REG_RSP && displacement < 0) ||
-                    (base_reg == REG_RBP && displacement > 0))
-                {
-                    return_value = 5;
-                    goto l_cleanup;
-                }
-            }
-        }
-    }
-
-l_cleanup:
-    RTN_Close(rtn);
-    return return_value;
-}
-
-int find_inlining_candidates()
-{
-    int return_value = -1;
-    RTN rtn;
-
-    for (const auto &pair : rtn_callers)
-    {
-        rtn = RTN_FindByAddress(pair.first);
-
-        if (!RTN_Valid(rtn))
-        {
-            cout << "Zut. Invalid. " << endl; // TODO
-            continue;
-        }
-
-        int rc = is_valid_for_inlining(rtn);
-        if (rc != 0)
-        {
-            cout << "Zut. rc " << rc << " " << endl; // TODO
-        }
-
-        inlining_candidates.push_back(pair);
-        return_value = 0;
-
-        cout << std::hex << pair.first << " " << pair.second << " valid" << endl; // TODO
-    }
-
-    return return_value;
-}
-
-/* ===================================================================== */
 /* Main translation routine                                              */
 /* ===================================================================== */
 
@@ -1130,10 +1218,73 @@ void load_profiled_candidates()
     }
 }
 
+void add_rtn_for_translation(RTN rtn)
+{
+    int rc;
+
+    translated_rtn[translated_rtn_num].rtn_addr = RTN_Address(rtn);
+    translated_rtn[translated_rtn_num].rtn_size = RTN_Size(rtn);
+    translated_rtn[translated_rtn_num].instr_map_entry = num_of_instr_map_entries;
+    translated_rtn[translated_rtn_num].isSafeForReplacedProbe = true;
+
+    // Open the RTN.
+    RTN_Open(rtn);
+
+    for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins))
+    {
+
+        //debug print of orig instruction:
+        if (KnobVerbose)
+        {
+            cerr << "old instr: ";
+            cerr << "0x" << hex << INS_Address(ins) << ": " << INS_Disassemble(ins) << endl;
+            //xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address (ins)), INS_Size(ins));
+        }
+
+        ADDRINT addr = INS_Address(ins);
+
+        xed_decoded_inst_t xedd;
+        xed_error_enum_t xed_code;
+
+        xed_decoded_inst_zero_set_mode(&xedd, &dstate);
+
+        xed_code = xed_decode(&xedd,
+                              reinterpret_cast<UINT8 *>(addr),
+                              max_inst_len);
+        if (xed_code != XED_ERROR_NONE)
+        {
+            cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << addr << endl;
+            translated_rtn[translated_rtn_num].instr_map_entry = -1;
+            break;
+        }
+
+        // Add instr into instr map:
+        rc = add_new_instr_entry(&xedd, INS_Address(ins), INS_Size(ins));
+        if (rc < 0)
+        {
+            cerr << "ERROR: failed during instructon translation." << endl;
+            translated_rtn[translated_rtn_num].instr_map_entry = -1;
+            break;
+        }
+
+        // debug print of routine name:
+        if (KnobVerbose)
+        {
+            cerr << "rtn name: " << RTN_Name(rtn) << " : " << dec << translated_rtn_num << endl;
+        }
+    } // end for INS...
+
+    // Close the RTN.
+    RTN_Close(rtn);
+
+    translated_rtn_num++;
+}
+
 int find_candidate_rtns_for_translation(IMG img)
 {
     int rc;
-    RTN rtn;
+    RTN first_rtn;
+    RTN second_rtn;
 
     // Find candidates for inlining.
     load_profiled_candidates();
@@ -1143,76 +1294,28 @@ int find_candidate_rtns_for_translation(IMG img)
         return rc;
     }
 
-    // go over routines and check if they are candidates for translation and mark them for translation:
-
+    // Add both callers and callees for inlining.
     for (const auto &pair : inlining_candidates)
     {
-        rtn = RTN_FindByAddress(pair.second);
+        first_rtn = RTN_FindByAddress(pair.first);
+        second_rtn = RTN_FindByAddress(pair.second);
 
-        if (rtn == RTN_Invalid())
+        if (!RTN_Valid(first_rtn))
         {
-            cerr << "Warning: invalid routine " << RTN_Name(rtn) << endl;
+            cerr << "Warning: invalid routine " << RTN_Name(first_rtn) << endl;
             continue;
         }
 
-        translated_rtn[translated_rtn_num].rtn_addr = RTN_Address(rtn);
-        translated_rtn[translated_rtn_num].rtn_size = RTN_Size(rtn);
-        translated_rtn[translated_rtn_num].instr_map_entry = num_of_instr_map_entries;
-        translated_rtn[translated_rtn_num].isSafeForReplacedProbe = true;
+        add_rtn_for_translation(first_rtn);
 
-        // Open the RTN.
-        RTN_Open(rtn);
-
-        for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins))
+        if (!RTN_Valid(second_rtn))
         {
-
-            //debug print of orig instruction:
-            if (KnobVerbose)
-            {
-                cerr << "old instr: ";
-                cerr << "0x" << hex << INS_Address(ins) << ": " << INS_Disassemble(ins) << endl;
-                //xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address (ins)), INS_Size(ins));
-            }
-
-            ADDRINT addr = INS_Address(ins);
-
-            xed_decoded_inst_t xedd;
-            xed_error_enum_t xed_code;
-
-            xed_decoded_inst_zero_set_mode(&xedd, &dstate);
-
-            xed_code = xed_decode(&xedd, reinterpret_cast<UINT8 *>(addr), max_inst_len);
-            if (xed_code != XED_ERROR_NONE)
-            {
-                cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << addr << endl;
-                translated_rtn[translated_rtn_num].instr_map_entry = -1;
-                break;
-            }
-
-            // Add instr into instr map:
-            rc = add_new_instr_entry(&xedd, INS_Address(ins), INS_Size(ins));
-            if (rc < 0)
-            {
-                cerr << "ERROR: failed during instructon translation." << endl;
-                translated_rtn[translated_rtn_num].instr_map_entry = -1;
-                break;
-            }
-        } // end for INS...
-
-
-        // debug print of routine name:
-        if (KnobVerbose)
-        {
-            cerr << "rtn name: " << RTN_Name(rtn) << " : " << dec << translated_rtn_num << endl;
+            cerr << "Warning: invalid routine " << RTN_Name(second_rtn) << endl;
+            continue;
         }
 
-
-        // Close the RTN.
-        RTN_Close(rtn);
-
-        translated_rtn_num++;
-    } // end for RTN..
-
+        add_rtn_for_translation(second_rtn);
+    }
 
     return 0;
 }
