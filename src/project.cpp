@@ -230,7 +230,6 @@ void dump_instr_from_mem (ADDRINT *address, ADDRINT new_addr)
   xed_format_context(XED_SYNTAX_INTEL, &new_xedd, disasm_buf, 2048, static_cast<UINT64>(new_addr), 0, 0);
 
   cerr << "0x" << hex << new_addr << ": " << disasm_buf <<  endl;
-
 }
 
 void dump_entire_instr_map()
