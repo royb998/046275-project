@@ -56,12 +56,13 @@ typedef struct
     UINT64 diff_count;
 } LOOP_DATA;
 
-std::map<ADDRINT, LOOP_DATA> loops;
-std::map<ADDRINT, UINT64> rtn_ins_counts;
+map<ADDRINT, LOOP_DATA> loops;
+map<ADDRINT, UINT64> rtn_ins_counts;
 map<ADDRINT, UINT64> rtn_call_counts;
 map<ADDRINT, map<ADDRINT, UINT64>> caller_count;
 map<ADDRINT, ADDRINT> rtn_callers;
-std::map<ADDRINT, ADDRINT> inlining_candidates;
+map<ADDRINT, ADDRINT> inlining_candidates;
+map<ADDRINT, UINT64> rtn_inline_count;
 
 // For XED:
 #if defined(TARGET_IA32E)
@@ -95,6 +96,7 @@ typedef struct
     xed_category_enum_t category_enum;
     unsigned int size;
     int targ_map_entry;
+    UINT64 inline_count;
 } instr_map_t;
 
 
@@ -112,7 +114,6 @@ typedef struct
     ADDRINT rtn_addr;
     USIZE rtn_size;
     int instr_map_entry;   // negative instr_map_entry means routine does not have a translation.
-    bool isSafeForReplacedProbe;
 } translated_rtn_t;
 
 translated_rtn_t * translated_rtn;
@@ -206,7 +207,7 @@ void dump_instr_from_xedd (xed_decoded_inst_t* xedd, ADDRINT address)
     // debug print decoded instr:
     char disasm_buf[2048];
 
-    xed_uint64_t runtime_address = static_cast<UINT64>(address);  // set the runtime adddress for disassembly
+    xed_uint64_t runtime_address = static_cast<UINT64>(address);  // set the runtime address for disassembly
 
     xed_format_context(XED_SYNTAX_INTEL, xedd, disasm_buf, sizeof(disasm_buf), static_cast<UINT64>(runtime_address), 0, 0);
 
@@ -248,13 +249,13 @@ void dump_entire_instr_map()
                 }
             }
         }
-        dump_instr_from_mem ((ADDRINT *)instr_map[i].new_ins_addr, instr_map[i].new_ins_addr);
+        dump_instr_from_mem((ADDRINT *)instr_map[i].new_ins_addr, instr_map[i].new_ins_addr);
     }
 }
 
 void dump_instr_map_entry(int instr_map_entry)
 {
-    cerr << dec << instr_map_entry << ": ";
+    cerr << dec << instr_map_entry << " (" << instr_map[instr_map_entry].inline_count << "): ";
     cerr << " orig_ins_addr: " << hex << instr_map[instr_map_entry].orig_ins_addr;
     cerr << " new_ins_addr: " << hex << instr_map[instr_map_entry].new_ins_addr;
     cerr << " orig_targ_addr: " << hex << instr_map[instr_map_entry].orig_targ_addr;
@@ -266,7 +267,7 @@ void dump_instr_map_entry(int instr_map_entry)
         new_targ_addr = instr_map[instr_map_entry].orig_targ_addr;
 
     cerr << " new_targ_addr: " << hex << new_targ_addr;
-    cerr << "    new instr:";
+    cerr << "\tnew instr:";
     dump_instr_from_mem((ADDRINT *)instr_map[instr_map_entry].encoded_ins, instr_map[instr_map_entry].new_ins_addr);
 }
 
@@ -295,7 +296,7 @@ void dump_tc()
 
       cerr << "0x" << hex << address << ": " << disasm_buf <<  endl;
 
-      size = xed_decoded_inst_get_length (&new_xedd);
+      size = xed_decoded_inst_get_length(&new_xedd);
   }
 }
 
@@ -468,6 +469,7 @@ int is_valid_for_inlining(RTN rtn)
 
             has_ret = true;
         }
+
         // Do not inline functions with indirect calls/jumps.
         else if (INS_IsIndirectControlFlow(ins))
         {
@@ -484,6 +486,13 @@ int is_valid_for_inlining(RTN rtn)
                 return_value = 4;
                 goto l_cleanup;
             }
+        }
+
+        if (INS_IsSub(ins) && INS_RegWContain(ins, REG::REG_RSP))
+        {
+//            cout << INS_Disassemble(ins) << endl; // TODO
+            return_value = 6;
+            goto l_cleanup;
         }
 
         // Do not inline functions with invalid r[sb]p offsets.
@@ -507,35 +516,35 @@ int is_valid_for_inlining(RTN rtn)
 
 l_cleanup:
     RTN_Close(rtn);
-    return return_value;
+    return return_value; // TODO: rv <= 6
 }
 
 int find_inlining_candidates()
 {
     int return_value = -1;
-    RTN rtn;
+    RTN callee;
 
     for (const auto &pair : rtn_callers)
     {
-        rtn = RTN_FindByAddress(pair.first);
+        callee = RTN_FindByAddress(pair.first);
 
-        if (!RTN_Valid(rtn))
+        if (!RTN_Valid(callee))
         {
-            cout << "Zut. Invalid. " << endl; // TODO
+//            cout << "Zut. Invalid. " << endl; // TODO
             continue;
         }
 
-        int rc = is_valid_for_inlining(rtn);
-        if (rc != 0)
+        return_value = is_valid_for_inlining(callee);
+        if (return_value != 0)
         {
-            cout << "Zut. rc " << rc << " " << endl; // TODO
+//            cout << "Zut. rc " << return_value << " " << endl; // TODO
+            continue;
         }
 
-        // inlining_candidates.push_back(pair);
         inlining_candidates[pair.first] = pair.second;
         return_value = 0;
 
-        cout << std::hex << pair.first << " " << pair.second << " valid" << endl; // TODO
+//         cout << std::hex << pair.first << " " << pair.second << " valid" << endl; // TODO
     }
 
     return return_value;
@@ -548,7 +557,7 @@ int inline_routine(ADDRINT rtn_address, int cursor)
     xed_error_enum_t xed_error;
     unsigned int size;
 
-    int success_count = 0; // TODO
+//    int success_count = 0; // TODO
 
     RTN rtn = RTN_FindByAddress(rtn_address);
 
@@ -584,7 +593,7 @@ int inline_routine(ADDRINT rtn_address, int cursor)
                                &size);
         if (xed_error != XED_ERROR_NONE) {
             cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;
-            cerr << "Managed to encode " << success_count << endl;
+//            cerr << "Managed to encode " << success_count << endl; // TODO
             for (int i = 0; i < XED_MAX_INSTRUCTION_BYTES; ++i)
             {
                 cout << " " << std::hex << inst_bytes[i];
@@ -597,7 +606,7 @@ int inline_routine(ADDRINT rtn_address, int cursor)
         memcpy(&tc[cursor], &inst_bytes, size);
         cursor += size;
 
-        success_count++;
+//        success_count++;
         ins = INS_Next(ins);
     }
 
@@ -610,7 +619,12 @@ l_cleanup:
 /* Translation routines                                         */
 /* ============================================================= */
 
-int add_new_instr_entry(xed_decoded_inst_t *xedd, ADDRINT pc, unsigned int size)
+int add_new_instr_entry(
+    xed_decoded_inst_t *xedd,
+    ADDRINT pc,
+    unsigned int size,
+    UINT64 inline_count
+)
 {
 
     // copy orig instr to instr map:
@@ -653,6 +667,7 @@ int add_new_instr_entry(xed_decoded_inst_t *xedd, ADDRINT pc, unsigned int size)
     instr_map[num_of_instr_map_entries].targ_map_entry = -1;
     instr_map[num_of_instr_map_entries].size = new_size;
     instr_map[num_of_instr_map_entries].category_enum = xed_decoded_inst_get_category(xedd);
+    instr_map[num_of_instr_map_entries].inline_count = inline_count;
 
     num_of_instr_map_entries++;
 
@@ -667,15 +682,56 @@ int add_new_instr_entry(xed_decoded_inst_t *xedd, ADDRINT pc, unsigned int size)
 
     // debug print new encoded instr:
     if (KnobVerbose) {
-        cerr << "    new instr:";
-        dump_instr_from_mem((ADDRINT *)instr_map[num_of_instr_map_entries-1].encoded_ins, instr_map[num_of_instr_map_entries-1].new_ins_addr);
+        cerr << "\tnew instr:";
+        dump_instr_from_mem((ADDRINT *)instr_map[num_of_instr_map_entries-1].encoded_ins,
+                            instr_map[num_of_instr_map_entries-1].new_ins_addr);
     }
 
     return new_size;
 }
 
+/**
+ * Find and chain the instruction to which the instruction indicated by
+ * `src_entry_index` jumps.
+ * */
+int find_target_entry(int src_entry_index)
+{
+    int return_value = -1;
+
+    // dump_instr_map_entry(src_entry_index);
+
+    for (int i = 0; i < num_of_instr_map_entries; ++i)
+    {
+        instr_map_t * src_entry = &instr_map[src_entry_index];
+        instr_map_t * target_entry = &instr_map[i];
+
+        if ((src_entry->orig_targ_addr == target_entry->orig_ins_addr) &&
+            (src_entry->inline_count == target_entry->inline_count))
+        {
+            return_value = 0;
+
+            // dump_instr_map_entry(i);
+
+            if (src_entry->hasNewTargAddr)
+            {
+                cout << "Zut. One source multiple targets." << endl;
+                continue;
+            }
+
+            src_entry->hasNewTargAddr = true;
+            src_entry->targ_map_entry = i;
+        }
+    }
+
+    return return_value;
+}
+
 int chain_all_direct_br_and_call_target_entries()
 {
+//    int return_value = 0;
+
+//    cout << "Entry count " << num_of_instr_map_entries << endl; // TODO
+
     for (int i=0; i < num_of_instr_map_entries; i++) {
 
         if (instr_map[i].orig_targ_addr == 0)
@@ -684,17 +740,12 @@ int chain_all_direct_br_and_call_target_entries()
         if (instr_map[i].hasNewTargAddr)
             continue;
 
-        for (int j = 0; j < num_of_instr_map_entries; j++) {
-
-            if (j == i)
-               continue;
-
-            if (instr_map[j].orig_ins_addr == instr_map[i].orig_targ_addr) {
-                instr_map[i].hasNewTargAddr = true;
-                instr_map[i].targ_map_entry = j;
-                break;
-            }
-        }
+        find_target_entry(i);
+        /*return_value = find_target_entry(i);
+        if (return_value != 0)
+        {
+            cout << "Zut. Source w/o target." << endl; // TODO
+        }*/
     }
 
     return 0;
@@ -1032,35 +1083,18 @@ int copy_instrs_to_tc()
     int cursor = 0;
 
     for (int i=0; i < num_of_instr_map_entries; i++) {
-        /*if ((ADDRINT)&tc[cursor] != instr_map[i].new_ins_addr) {
+        if ((ADDRINT)&tc[cursor] != instr_map[i].new_ins_addr) {
             cerr << "ERROR: Non-matching instruction addresses: " << hex
                  << (ADDRINT)&tc[cursor] << " vs. " << instr_map[i].new_ins_addr
                  << endl;
             return -1;
-        }*/
+        }
 
-        if ((XED_CATEGORY_CALL == instr_map[i].category_enum) &&
-            (inlining_candidates.count(instr_map[i].orig_targ_addr) > 0) &&
-            (instr_map[i].orig_ins_addr == inlining_candidates[instr_map[i].orig_targ_addr]))
-        {
-            cout << "Yay! might inline " << std::hex << instr_map[i].orig_ins_addr << endl;
-            cursor = inline_routine(instr_map[i].orig_targ_addr, cursor);
-            if (cursor < 0)
-            {
-                cout << "ERROR: Failed to inline function at 0x" <<
-                     std::hex << instr_map[i].orig_targ_addr << endl;
-                return -1;
-            }
-        }
-        else
-        {
-            instr_map[i].new_ins_addr = (ADDRINT)&tc[cursor];
-            memcpy(&tc[cursor], &instr_map[i].encoded_ins, instr_map[i].size);
-            cursor += instr_map[i].size;
-        }
+        memcpy(&tc[cursor], &instr_map[i].encoded_ins, instr_map[i].size);
+        cursor += instr_map[i].size;
     }
 
-    tc_cursor = cursor;
+    // tc_cursor = cursor;
 
     return 0;
 }
@@ -1076,7 +1110,8 @@ inline void commit_translated_routines()
 
         if (translated_rtn[i].instr_map_entry >= 0) {
 
-            if (translated_rtn[i].rtn_size > MAX_PROBE_JUMP_INSTR_BYTES && translated_rtn[i].isSafeForReplacedProbe) {
+            if (translated_rtn[i].rtn_size > MAX_PROBE_JUMP_INSTR_BYTES)
+            {
 
                 RTN rtn = RTN_FindByAddress(translated_rtn[i].rtn_addr);
 
@@ -1181,6 +1216,9 @@ int allocate_and_init_memory(IMG img)
 /* Main translation routine                                              */
 /* ===================================================================== */
 
+/**
+ * Load all callee-caller pair with valid callers from the profiling output.
+ * */
 void load_profiled_candidates()
 {
     ifstream csv_file(count_file);
@@ -1218,6 +1256,139 @@ void load_profiled_candidates()
     }
 }
 
+/**
+ * Add the given `rtn` to the inst_map array, instruction by instruction. If any
+ * call in rtn is to an inline target, add those instructions as if they were
+ * part of `rtn` (i.e. inline this call).
+ *
+ * @param IN rtn    Routine to instrument.
+ * */
+int add_rtn_to_inst_map(RTN rtn)
+{
+    int rc = 0;
+    bool skip;
+    int size;
+    ADDRINT ins_addr;
+    ADDRINT rtn_addr;
+    ADDRINT rtn_end;
+    xed_decoded_inst_t xedd;
+    xed_error_enum_t xed_code;
+
+    // cout << "Adding for translation" << endl; // TODO
+
+    // Open the RTN.
+    RTN_Open(rtn);
+    INS head = RTN_InsHead(rtn);
+    rtn_end = INS_Address(RTN_InsTail(rtn));
+    // INS tail = RTN_InsTail(rtn);
+    RTN_Close(rtn);
+
+    rtn_addr = RTN_Address(rtn);
+    if (rtn_inline_count.count(rtn_addr) == 0)
+    {
+        rtn_inline_count[rtn_addr] = 0;
+    }
+
+    ins_addr = INS_Address(head);
+
+    // for (INS ins = head; INS_Valid(ins); ins = INS_Next(ins))
+    while (ins_addr <= rtn_end)
+    {
+        xed_decoded_inst_zero_set_mode(&xedd, &dstate);
+
+        xed_code = xed_decode(&xedd,
+                              reinterpret_cast<UINT8 *>(ins_addr),
+                              max_inst_len);
+        if (xed_code != XED_ERROR_NONE)
+        {
+            cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << ins_addr << endl;
+            translated_rtn[translated_rtn_num].instr_map_entry = -1;
+            break;
+        }
+
+        size = xed_decoded_inst_get_length(&xedd);
+
+        //debug print of orig instruction:
+        if (KnobVerbose)
+        {
+            cerr << "old instr: ";
+            // cerr << "0x" << hex << ins_addr << ": " << INS_Disassemble(ins) << endl;
+            dump_instr_from_xedd(&xedd, ins_addr);
+            //xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address (ins)), INS_Size(ins));
+        }
+
+        skip = false;
+
+        xed_category_enum_t category_enum = xed_decoded_inst_get_category(&xedd);
+        if (XED_CATEGORY_CALL == category_enum)
+        {
+            // cout << "found call" << endl; // TODO
+
+            xed_uint_t disp_byts = xed_decoded_inst_get_branch_displacement_width(&xedd);
+            xed_int32_t disp;
+
+            ADDRINT target_addr;
+
+            if (disp_byts <= 0) {
+                cout << "Zut. call with no offset." << endl;
+                return -1;
+            }
+
+            disp = xed_decoded_inst_get_branch_displacement(&xedd);
+            target_addr = ins_addr + xed_decoded_inst_get_length (&xedd) + disp;
+
+            if ((inlining_candidates.count(target_addr) > 0) &&
+                (ins_addr == inlining_candidates[target_addr]))
+            {
+                rc = add_rtn_to_inst_map(RTN_FindByAddress(target_addr));
+                if (rc != 0)
+                {
+                    cout << "Zut. failed to inline." << endl;
+                    return -1;
+                }
+
+                rtn_inline_count[target_addr]++;
+
+                // Ignore `ret` inst by decrementing entry count & tc cursor.
+                num_of_instr_map_entries--;
+                tc_cursor--;
+
+                skip = true;
+            }
+        }
+
+        if (!skip)
+        {
+            // Add instr into instr map:
+            rc = add_new_instr_entry(&xedd, ins_addr, size,
+                                     rtn_inline_count[rtn_addr]);
+            if (rc < 0)
+            {
+                cerr << "ERROR: failed during instruction translation." << endl;
+                translated_rtn[translated_rtn_num].instr_map_entry = -1;
+                return -1;
+            }
+        }
+
+        // debug print of routine name:
+        if (KnobVerbose)
+        {
+            cerr << "\trtn name: " << RTN_Name(rtn) << " : " << dec << translated_rtn_num;
+            cerr << " : " << hex << rtn_addr;
+            cerr << " : " << hex << RTN_Address(rtn);
+            cerr << " : " << rtn_inline_count[rtn_addr];
+            cerr << "; " << hex << ins_addr << endl;
+        }
+
+        ins_addr += size;
+    } // end for INS...
+
+    // Close the RTN.
+    // RTN_Close(rtn);
+
+    return 0;
+}
+
 void add_rtn_for_translation(RTN rtn)
 {
     int rc;
@@ -1225,57 +1396,12 @@ void add_rtn_for_translation(RTN rtn)
     translated_rtn[translated_rtn_num].rtn_addr = RTN_Address(rtn);
     translated_rtn[translated_rtn_num].rtn_size = RTN_Size(rtn);
     translated_rtn[translated_rtn_num].instr_map_entry = num_of_instr_map_entries;
-    translated_rtn[translated_rtn_num].isSafeForReplacedProbe = true;
 
-    // Open the RTN.
-    RTN_Open(rtn);
-
-    for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins))
+    rc = add_rtn_to_inst_map(rtn);
+    if (rc != 0)
     {
-
-        //debug print of orig instruction:
-        if (KnobVerbose)
-        {
-            cerr << "old instr: ";
-            cerr << "0x" << hex << INS_Address(ins) << ": " << INS_Disassemble(ins) << endl;
-            //xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address (ins)), INS_Size(ins));
-        }
-
-        ADDRINT addr = INS_Address(ins);
-
-        xed_decoded_inst_t xedd;
-        xed_error_enum_t xed_code;
-
-        xed_decoded_inst_zero_set_mode(&xedd, &dstate);
-
-        xed_code = xed_decode(&xedd,
-                              reinterpret_cast<UINT8 *>(addr),
-                              max_inst_len);
-        if (xed_code != XED_ERROR_NONE)
-        {
-            cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << addr << endl;
-            translated_rtn[translated_rtn_num].instr_map_entry = -1;
-            break;
-        }
-
-        // Add instr into instr map:
-        rc = add_new_instr_entry(&xedd, INS_Address(ins), INS_Size(ins));
-        if (rc < 0)
-        {
-            cerr << "ERROR: failed during instructon translation." << endl;
-            translated_rtn[translated_rtn_num].instr_map_entry = -1;
-            break;
-        }
-
-        // debug print of routine name:
-        if (KnobVerbose)
-        {
-            cerr << "rtn name: " << RTN_Name(rtn) << " : " << dec << translated_rtn_num << endl;
-        }
-    } // end for INS...
-
-    // Close the RTN.
-    RTN_Close(rtn);
+        cout << "Failed to add routines for translation.\n";
+    }
 
     translated_rtn_num++;
 }
@@ -1283,8 +1409,6 @@ void add_rtn_for_translation(RTN rtn)
 int find_candidate_rtns_for_translation(IMG img)
 {
     int rc;
-    RTN first_rtn;
-    RTN second_rtn;
 
     // Find candidates for inlining.
     load_profiled_candidates();
@@ -1294,27 +1418,37 @@ int find_candidate_rtns_for_translation(IMG img)
         return rc;
     }
 
-    // Add both callers and callees for inlining.
+/*
+    for (SEC sec = IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec))
+    {
+        if (!SEC_IsExecutable(sec) || SEC_IsWriteable(sec) || !SEC_Address(sec))
+            continue;
+
+        for (RTN rtn = SEC_RtnHead(sec); RTN_Valid(rtn); rtn = RTN_Next(rtn))
+        {
+
+            if (rtn == RTN_Invalid()) {
+                cerr << "Warning: invalid routine " << RTN_Name(rtn) << endl;
+                continue;
+            }
+            add_rtn_for_translation(rtn);
+        } // end for RTN..
+    } // end for SEC...
+*/
+
+    RTN caller;
+
     for (const auto &pair : inlining_candidates)
     {
-        first_rtn = RTN_FindByAddress(pair.first);
-        second_rtn = RTN_FindByAddress(pair.second);
+        caller = RTN_FindByAddress(pair.second);
 
-        if (!RTN_Valid(first_rtn))
+        if (!RTN_Valid(caller))
         {
-            cerr << "Warning: invalid routine " << RTN_Name(first_rtn) << endl;
+            cerr << "Warning: invalid routine " << RTN_Name(caller) << endl;
             continue;
         }
 
-        add_rtn_for_translation(first_rtn);
-
-        if (!RTN_Valid(second_rtn))
-        {
-            cerr << "Warning: invalid routine " << RTN_Name(second_rtn) << endl;
-            continue;
-        }
-
-        add_rtn_for_translation(second_rtn);
+        add_rtn_for_translation(caller);
     }
 
     return 0;
