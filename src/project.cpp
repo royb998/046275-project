@@ -38,7 +38,8 @@ using std::ofstream;
 const float HOT_CALL_THRESH = 0.9;
 const int HOT_CALL_MIN_COUNT = 2;
 
-const std::string count_file = "loop-count.csv";
+const std::string loop_profile = "loop-count.csv";
+const std::string rtn_profile = "rtn-count.csv";
 
 /* ===================================================================== */
 /* Types and Globals                                                     */
@@ -1221,11 +1222,11 @@ int allocate_and_init_memory(IMG img)
  * */
 void load_profiled_candidates()
 {
-    ifstream csv_file(count_file);
+    ifstream csv_file(rtn_profile);
 
     if (!csv_file.good())
     {
-        cout << "Error, can't open " << count_file << endl;
+        cout << "Zut. can't open " << rtn_profile << endl;
         exit(1);
     }
 
@@ -1243,10 +1244,10 @@ void load_profiled_candidates()
                 split_line.push_back(split_word);
             }
 
-            ADDRINT callee = (ADDRINT)strtol(split_line[6].c_str(), NULL, 16) + main_image_addr;
-            ADDRINT caller = (ADDRINT)strtol(split_line[9].c_str(), NULL, 16);
+            ADDRINT callee = (ADDRINT)strtol(split_line[0].c_str(), NULL, 16) + main_image_addr;
+            ADDRINT caller = (ADDRINT)strtol(split_line[3].c_str(), NULL, 16);
 
-            if (caller != 0 && rtn_callers.count(callee) == 0)
+            if (caller != 0)
             {
                 rtn_callers[callee] = caller + main_image_addr;
             }
@@ -1521,12 +1522,15 @@ VOID ImageLoad(IMG img, VOID * v)
 
 /* ===================================================================== */
 
+
 VOID Fini(INT32 code, VOID* v)
 {
-    ofstream to(count_file);
+    ADDRINT rtn_address;
+
+    ofstream to(loop_profile);
     if (!to)
     {
-        cerr << "ERROR, can't open file: loop-count.csv" << endl;
+        cerr << "ERROR, can't open file: " << loop_profile << endl;
         return;
     }
 
@@ -1539,30 +1543,10 @@ VOID Fini(INT32 code, VOID* v)
 
     for (std::multimap<UINT32, LOOP_DATA>::const_iterator it = sorted_loops_map.begin(); it != sorted_loops_map.end(); ++it)
     {
-        ADDRINT rtn_address = it->second.rtn_addr;
+        rtn_address = it->second.rtn_addr;
 
         if (it->second.count_seen > 0 && it->second.count_invoked > 0)
         {
-            ADDRINT max_caller = 0;
-            UINT64 max_calls = 0;
-            for (auto iter = caller_count[rtn_address].begin();
-                 iter != caller_count[rtn_address].end(); ++iter)
-            {
-                UINT64 current_count = iter->second;
-
-                if ((current_count < HOT_CALL_MIN_COUNT) ||
-                    ((float)current_count / rtn_call_counts[rtn_address] < HOT_CALL_THRESH))
-                {
-                    continue;
-                }
-
-                if (max_calls < current_count)
-                {
-                    max_caller = iter->first - main_image_addr;
-                    max_calls = current_count;
-                }
-            }
-
             to << "0x" << std::hex << it->second.loop_target_addr
                << ", " << std::dec << it->second.count_seen
                << ", " << it->second.count_invoked
@@ -1572,12 +1556,58 @@ VOID Fini(INT32 code, VOID* v)
                << ", " << "0x" << std::hex << (rtn_address - main_image_addr)
                << ", " << std::dec << rtn_ins_counts[rtn_address]
                << ", " << std::dec << rtn_call_counts[rtn_address]
-               << ", " << "0x" << std::hex << max_caller
-               << ", " << std::dec << max_calls
                << endl;
         }
     }
     to.close();
+
+    ofstream to2(rtn_profile);
+    if (!to2)
+    {
+        cerr << "ERROR, can't open file: " << rtn_profile << endl;
+        return;
+    }
+
+    ADDRINT max_caller = 0;
+    UINT64 max_calls = 0;
+
+    for (auto &pair : caller_count)
+    {
+        max_caller = 0;
+        max_calls = 0;
+
+        for (auto &iter : pair.second)
+        {
+            UINT64 current_count = iter.second;
+
+            if ((current_count < HOT_CALL_MIN_COUNT) ||
+                ((float)current_count / rtn_call_counts[pair.first] < HOT_CALL_THRESH))
+            {
+                continue;
+            }
+
+            if (max_calls < current_count)
+            {
+                max_caller = iter.first - main_image_addr;
+                max_calls = current_count;
+            }
+        }
+
+        if (max_calls > 0)
+        {
+            rtn_address = pair.first;
+
+            to2 << "0x" << std::hex << (rtn_address - main_image_addr)
+                << ", " << std::dec << rtn_ins_counts[rtn_address]
+                << ", " << std::dec << rtn_call_counts[rtn_address]
+                << ", " << "0x" << std::hex << max_caller
+                << ", " << std::dec << max_calls
+                << endl;
+        }
+    }
+
+    to2.close();
+
 }
 
 /* ===================================================================== */
