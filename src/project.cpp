@@ -14,6 +14,8 @@ extern "C" {
 #include <iostream>
 #include <malloc.h>
 #include <map>
+#include <vector>
+#include <set>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +38,7 @@ using std::ofstream;
 /* ===================================================================== */
 
 const float HOT_CALL_THRESH = 0.9;
+const float HOT_LOOP_THRESH = 0.7;
 const int HOT_CALL_MIN_COUNT = 2;
 
 const std::string loop_profile = "loop-count.csv";
@@ -64,6 +67,9 @@ map<ADDRINT, map<ADDRINT, UINT64>> caller_count;
 map<ADDRINT, ADDRINT> rtn_callers;
 map<ADDRINT, ADDRINT> inlining_candidates;
 map<ADDRINT, UINT64> rtn_inline_count;
+map<ADDRINT, float> loop_heat;
+map<ADDRINT, ADDRINT> reordering_targets;
+
 
 // For XED:
 #if defined(TARGET_IA32E)
@@ -433,6 +439,48 @@ VOID instrument_routine(RTN rtn, VOID* v)
 /* Function Inlining                                                     */
 /* ===================================================================== */
 
+/**
+ * Load all callee-caller pair with valid callers from the profiling output.
+ * */
+void load_inlining_candidates()
+{
+    ifstream csv_file(rtn_profile);
+
+    if (!csv_file.good())
+    {
+        cout << "Zut. can't open " << rtn_profile << endl;
+        exit(1);
+    }
+
+    if (csv_file.is_open())
+    {
+        string line;
+        while (getline(csv_file, line))
+        {
+            std::vector <std::string> split_line;
+            std::string split_word;
+            std::istringstream string_stream(line);
+
+            while (std::getline(string_stream, split_word, ','))
+            {
+                split_line.push_back(split_word);
+            }
+
+            ADDRINT callee = strtol(split_line[0].c_str(),
+                                    nullptr, 16) + main_image_addr;
+            ADDRINT caller = strtol(split_line[3].c_str(),
+                                    nullptr, 16);
+
+            if (caller != 0)
+            {
+                rtn_callers[callee] = caller + main_image_addr;
+            }
+        }
+
+        csv_file.close();
+    }
+}
+
 int is_valid_for_inlining(RTN rtn)
 {
     int return_value = 0;
@@ -614,6 +662,91 @@ int inline_routine(ADDRINT rtn_address, int cursor)
 l_cleanup:
     RTN_Close(rtn);
     return cursor;
+}
+
+/* ============================================================= */
+/* Code Reordering                                               */
+/* ============================================================= */
+
+/**
+ * Load hot loops from the code based on profiling.
+ * */
+void load_reordering_candidates()
+{
+    ifstream csv_file(loop_profile);
+
+    if (!csv_file.good())
+    {
+        cout << "Zut. can't open " << loop_profile << endl;
+        exit(1);
+    }
+
+    if (csv_file.is_open())
+    {
+        string line;
+        while (getline(csv_file, line))
+        {
+            std::vector <std::string> split_line;
+            std::string split_word;
+            std::istringstream string_stream(line);
+
+            while (std::getline(string_stream, split_word, ','))
+            {
+                split_line.push_back(split_word);
+            }
+
+            float count_seen = strtof(split_line[1].c_str(),
+                                      nullptr);
+            float count_taken = strtof(split_line[2].c_str(),
+                                       nullptr);
+
+            ADDRINT loop_addr = strtol(split_line[0].c_str(),
+                                       nullptr, 16) + main_image_addr;
+            float percent_taken = count_taken / count_seen;
+
+            if (percent_taken > 1)
+            {
+                cout << "Zut. Bad count." << endl; // TODO
+                continue;
+            }
+
+            loop_heat[loop_addr] = percent_taken;
+        }
+
+        csv_file.close();
+    }
+}
+
+/**
+ * @brief Find target addresses for code reordering.
+ * @return 0 for success; Other values for failure.
+ */
+int find_reordering_targets()
+{
+    int return_value = -1;
+    RTN target_routine;
+
+    for (const auto &pair : loop_heat)
+    {
+        target_routine = RTN_FindByAddress(pair.first);
+
+        if (!RTN_Valid(target_routine))
+        {
+            cout << "Zut. Invalid loop " << std::hex << pair.first << endl; // TODO
+            continue;
+        }
+
+        if (pair.second < HOT_LOOP_THRESH)
+        {
+//            cout << "Zut. Cold at " << std::hex << pair.first << endl; // TODO
+            continue;
+        }
+
+        reordering_targets[pair.first] = RTN_Address(target_routine);
+        return_value = 0;
+    }
+
+    return return_value;
 }
 
 /* ============================================================= */
@@ -826,7 +959,6 @@ int fix_rip_displacement(int instr_map_entry)
 
 int fix_direct_br_call_to_orig_addr(int instr_map_entry)
 {
-
     xed_decoded_inst_t xedd;
     xed_decoded_inst_zero_set_mode(&xedd,&dstate);
 
@@ -839,8 +971,7 @@ int fix_direct_br_call_to_orig_addr(int instr_map_entry)
     xed_category_enum_t category_enum = xed_decoded_inst_get_category(&xedd);
 
     if (category_enum != XED_CATEGORY_CALL && category_enum != XED_CATEGORY_UNCOND_BR) {
-
-        cerr << "ERROR: Invalid direct jump from translated code to original code in rotuine: "
+        cerr << "ERROR: Invalid direct jump from translated code to original code in routine: "
               << RTN_Name(RTN_FindByAddress(instr_map[instr_map_entry].orig_ins_addr)) << endl;
         dump_instr_map_entry(instr_map_entry);
         return -1;
@@ -948,7 +1079,6 @@ int fix_direct_br_call_displacement(int instr_map_entry)
     unsigned int size = XED_MAX_INSTRUCTION_BYTES;
     unsigned int new_size = 0;
 
-
     xed_category_enum_t category_enum = xed_decoded_inst_get_category(&xedd);
 
     if (category_enum != XED_CATEGORY_CALL && category_enum != XED_CATEGORY_COND_BR && category_enum != XED_CATEGORY_UNCOND_BR) {
@@ -1028,7 +1158,6 @@ int fix_instructions_displacements()
     int size_diff = 0;
 
     do {
-
         size_diff = 0;
 
         if (KnobVerbose) {
@@ -1218,46 +1347,6 @@ int allocate_and_init_memory(IMG img)
 /* ===================================================================== */
 
 /**
- * Load all callee-caller pair with valid callers from the profiling output.
- * */
-void load_profiled_candidates()
-{
-    ifstream csv_file(rtn_profile);
-
-    if (!csv_file.good())
-    {
-        cout << "Zut. can't open " << rtn_profile << endl;
-        exit(1);
-    }
-
-    if (csv_file.is_open())
-    {
-        string line;
-        while (getline(csv_file, line))
-        {
-            std::vector <std::string> split_line;
-            std::string split_word;
-            std::istringstream string_stream(line);
-
-            while (std::getline(string_stream, split_word, ','))
-            {
-                split_line.push_back(split_word);
-            }
-
-            ADDRINT callee = (ADDRINT)strtol(split_line[0].c_str(), NULL, 16) + main_image_addr;
-            ADDRINT caller = (ADDRINT)strtol(split_line[3].c_str(), NULL, 16);
-
-            if (caller != 0)
-            {
-                rtn_callers[callee] = caller + main_image_addr;
-            }
-        }
-
-        csv_file.close();
-    }
-}
-
-/**
  * Add the given `rtn` to the inst_map array, instruction by instruction. If any
  * call in rtn is to an inline target, add those instructions as if they were
  * part of `rtn` (i.e. inline this call).
@@ -1269,19 +1358,19 @@ int add_rtn_to_inst_map(RTN rtn)
     int rc = 0;
     bool skip;
     int size;
-    ADDRINT ins_addr;
+    INS head;
     ADDRINT rtn_addr;
     ADDRINT rtn_end;
+    ADDRINT ins_addr;
     xed_decoded_inst_t xedd;
     xed_error_enum_t xed_code;
 
     // cout << "Adding for translation" << endl; // TODO
 
-    // Open the RTN.
+    // Get routine boundries.
     RTN_Open(rtn);
-    INS head = RTN_InsHead(rtn);
+    head = RTN_InsHead(rtn);
     rtn_end = INS_Address(RTN_InsTail(rtn));
-    // INS tail = RTN_InsTail(rtn);
     RTN_Close(rtn);
 
     rtn_addr = RTN_Address(rtn);
@@ -1292,7 +1381,6 @@ int add_rtn_to_inst_map(RTN rtn)
 
     ins_addr = INS_Address(head);
 
-    // for (INS ins = head; INS_Valid(ins); ins = INS_Next(ins))
     while (ins_addr <= rtn_end)
     {
         xed_decoded_inst_zero_set_mode(&xedd, &dstate);
@@ -1384,24 +1472,42 @@ int add_rtn_to_inst_map(RTN rtn)
         ins_addr += size;
     } // end for INS...
 
-    // Close the RTN.
-    // RTN_Close(rtn);
-
     return 0;
 }
 
 void add_rtn_for_translation(RTN rtn)
 {
     int rc;
+    int tc_saved;
+    int current_entry_count;
 
-    translated_rtn[translated_rtn_num].rtn_addr = RTN_Address(rtn);
+    // Backup translation data in case of translation failure.
+    tc_saved = tc_cursor;
+    current_entry_count = num_of_instr_map_entries;
+    ADDRINT rtn_address = RTN_Address(rtn);
+
+    // Skip over routines that were already added for translation.
+    for (int i = 0; i < translated_rtn_num; ++i)
+    {
+        if (translated_rtn[i].rtn_addr == rtn_address)
+        {
+            return;
+        }
+    }
+
+    translated_rtn[translated_rtn_num].rtn_addr = rtn_address;
     translated_rtn[translated_rtn_num].rtn_size = RTN_Size(rtn);
     translated_rtn[translated_rtn_num].instr_map_entry = num_of_instr_map_entries;
 
     rc = add_rtn_to_inst_map(rtn);
     if (rc != 0)
     {
-        cout << "Failed to add routines for translation.\n";
+        cout << "Zut. Failed to add routine " << std::hex << RTN_Address(rtn)
+             << " " << RTN_Name(rtn) << " " << rc << endl;
+        // Backup after failure to translate, as if the routine was never translated.
+        tc_cursor = tc_saved;
+        num_of_instr_map_entries = current_entry_count;
+        return;
     }
 
     translated_rtn_num++;
@@ -1411,8 +1517,31 @@ int find_candidate_rtns_for_translation(IMG img)
 {
     int rc;
 
+    RTN target;
+
+    // Find candidates for reordering.
+    load_reordering_candidates();
+    rc = find_reordering_targets();
+//    if (rc != 0)
+//    {
+//        return rc; // TODO
+//    }
+
+    for (auto &pair : reordering_targets)
+    {
+        target = RTN_FindByAddress(pair.second);
+
+        if (!RTN_Valid(target))
+        {
+            cerr << "Warning: invalid routine " << RTN_Name(target) << endl;
+            continue;
+        }
+
+        add_rtn_for_translation(target);
+    }
+
     // Find candidates for inlining.
-    load_profiled_candidates();
+    load_inlining_candidates();
     rc = find_inlining_candidates();
     if (rc != 0)
     {
@@ -1437,19 +1566,17 @@ int find_candidate_rtns_for_translation(IMG img)
     } // end for SEC...
 */
 
-    RTN caller;
-
     for (const auto &pair : inlining_candidates)
     {
-        caller = RTN_FindByAddress(pair.second);
+        target = RTN_FindByAddress(pair.second);
 
-        if (!RTN_Valid(caller))
+        if (!RTN_Valid(target))
         {
-            cerr << "Warning: invalid routine " << RTN_Name(caller) << endl;
+            cerr << "Warning: invalid routine " << RTN_Name(target) << endl;
             continue;
         }
 
-        add_rtn_for_translation(caller);
+        add_rtn_for_translation(target);
     }
 
     return 0;
@@ -1541,13 +1668,14 @@ VOID Fini(INT32 code, VOID* v)
         sorted_loops_map.insert(std::pair<UINT32, LOOP_DATA>(it->second.count_seen * -1, it->second));
     }
 
-    for (std::multimap<UINT32, LOOP_DATA>::const_iterator it = sorted_loops_map.begin(); it != sorted_loops_map.end(); ++it)
+    for (std::multimap<UINT32, LOOP_DATA>::const_iterator it = sorted_loops_map.begin();
+         it != sorted_loops_map.end(); ++it)
     {
         rtn_address = it->second.rtn_addr;
 
         if (it->second.count_seen > 0 && it->second.count_invoked > 0)
         {
-            to << "0x" << std::hex << it->second.loop_target_addr
+            to << "0x" << std::hex << it->second.loop_target_addr - main_image_addr
                << ", " << std::dec << it->second.count_seen
                << ", " << it->second.count_invoked
                << ", " << std::dec << it->second.count_seen / (double)it->second.count_invoked
