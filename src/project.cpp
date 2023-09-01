@@ -749,22 +749,196 @@ int find_reordering_targets()
     return return_value;
 }
 
+/**
+ * @brief Reorder the branch instruction at `ins_addr` (described by `xedd`) such that
+ *      the T/NT paths are reversed. Add a new oncond jmp to ensure correctness.
+ * @param xedd     IN   Branch to invert.
+ * @param ins_addr IN   Address of isntruction to invert.
+ * @param new_jmp  OUT  XED object of new jmp instruction.
+ * @return 0 for success; Other values otherwise.
+ */
+int reorder_branch(
+    xed_decoded_inst_t * xedd,
+    ADDRINT ins_addr,
+    xed_decoded_inst_t * new_jump
+)
+{
+    char buf[2048];
+
+    if (KnobVerbose)
+    {
+        xed_format_context(XED_SYNTAX_INTEL, xedd, buf, 2048, ins_addr, 0, 0);
+        cerr << "orig instr: " << hex << ins_addr << " " << buf << endl;
+    }
+
+    xed_category_enum_t category_enum = xed_decoded_inst_get_category(xedd);
+
+    if (category_enum != XED_CATEGORY_COND_BR)
+    {
+        return -1;
+    }
+
+    xed_iclass_enum_t iclass_enum = xed_decoded_inst_get_iclass(xedd);
+
+    if (iclass_enum == XED_ICLASS_JRCXZ)
+    {
+        return 0; // do not revert JRCXZ
+    }
+
+    xed_iclass_enum_t inverted_class;
+
+    switch (iclass_enum) {
+        case XED_ICLASS_JB:
+            inverted_class = XED_ICLASS_JNB;
+            break;
+        case XED_ICLASS_JBE:
+            inverted_class = XED_ICLASS_JNBE;
+            break;
+        case XED_ICLASS_JL:
+            inverted_class = XED_ICLASS_JNL;
+            break;
+        case XED_ICLASS_JLE:
+            inverted_class = XED_ICLASS_JNLE;
+            break;
+        case XED_ICLASS_JNB:
+            inverted_class = XED_ICLASS_JB;
+            break;
+        case XED_ICLASS_JNBE:
+            inverted_class = XED_ICLASS_JBE;
+            break;
+        case XED_ICLASS_JNL:
+            inverted_class = XED_ICLASS_JL;
+            break;
+        case XED_ICLASS_JNLE:
+            inverted_class = XED_ICLASS_JLE;
+            break;
+        case XED_ICLASS_JNO:
+            inverted_class = XED_ICLASS_JO;
+            break;
+        case XED_ICLASS_JNP:
+            inverted_class = XED_ICLASS_JP;
+            break;
+        case XED_ICLASS_JNS:
+            inverted_class = XED_ICLASS_JS;
+            break;
+        case XED_ICLASS_JNZ:
+            inverted_class = XED_ICLASS_JZ;
+            break;
+        case XED_ICLASS_JO:
+            inverted_class = XED_ICLASS_JNO;
+            break;
+        case XED_ICLASS_JP:
+            inverted_class = XED_ICLASS_JNP;
+            break;
+        case XED_ICLASS_JS:
+            inverted_class = XED_ICLASS_JNS;
+            break;
+        case XED_ICLASS_JZ:
+            inverted_class = XED_ICLASS_JNZ;
+            break;
+        default:
+            // Return error if jump is not recognized.
+            return -1;
+    }
+
+    xed_int32_t disp = xed_decoded_inst_get_branch_displacement(xedd);
+
+    // Converts the decoder request to a valid encoder request:
+    xed_encoder_request_init_from_decode(xedd);
+    xed_encoder_request_set_iclass(xedd, inverted_class);
+    xed_encoder_request_set_branch_displacement(xedd,
+        /*xed_int32_t*/  	0,
+        /*xed_uint_t*/  	1);
+    // set the inverted opcode.
+
+    xed_uint8_t enc_buf[XED_MAX_INSTRUCTION_BYTES];
+    unsigned int max_size = XED_MAX_INSTRUCTION_BYTES;
+    unsigned int new_size = 0;
+
+    xed_error_enum_t xed_error = xed_encode(xedd, enc_buf, max_size, &new_size);
+    if (xed_error != XED_ERROR_NONE)
+    {
+        cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) <<  endl;
+        return -1;
+    }
+
+    xed_decoded_inst_zero_set_mode(xedd, &dstate);
+    xed_error_enum_t xed_code = xed_decode(xedd, enc_buf, XED_MAX_INSTRUCTION_BYTES);
+    if (xed_code != XED_ERROR_NONE)
+    {
+        cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << ins_addr << endl;
+        return -1;
+    }
+
+    if (KnobVerbose)
+    {
+        xed_format_context(XED_SYNTAX_INTEL, xedd, buf, 2048, ins_addr, 0, 0);
+        cerr << "inverted cond jump: " << hex << ins_addr << " " << buf << endl;
+    }
+
+    // Create new jmp instruction to keep correctness of code.
+    xed_uint8_t enc_buf2[XED_MAX_INSTRUCTION_BYTES];
+    xed_encoder_instruction_t enc_instr;
+
+    xed_inst1(&enc_instr, dstate,
+              XED_ICLASS_JMP, 64,
+              xed_relbr(disp - 3, 32));
+//              xed_relbr(disp - new_size, 32));
+
+    xed_encoder_request_t enc_req;
+
+    xed_encoder_request_zero_set_mode(&enc_req, &dstate);
+    xed_bool_t convert_ok = xed_convert_to_encoder_request(&enc_req,
+                                                           &enc_instr);
+    if (!convert_ok)
+    {
+        cerr << "conversion to encode request failed" << endl;
+        return -1;
+    }
+
+    xed_error = xed_encode(&enc_req, enc_buf2, max_size, &new_size);
+    if (xed_error != XED_ERROR_NONE)
+    {
+        cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;
+        return -1;
+    }
+
+    xed_decoded_inst_t new_xedd;
+    xed_decoded_inst_zero_set_mode(&new_xedd,&dstate);
+
+    xed_code = xed_decode(&new_xedd, enc_buf2, XED_MAX_INSTRUCTION_BYTES);
+    if (xed_code != XED_ERROR_NONE)
+    {
+        cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << ins_addr << endl;
+        return -1;
+    }
+
+    if (KnobVerbose)
+    {
+        xed_format_context(XED_SYNTAX_INTEL, &new_xedd, buf, 2048, ins_addr, 0, 0);
+        cerr << "newly added uncond jump: " << hex << ins_addr << " " << buf << endl << endl;
+    }
+
+//    xed_decoded_inst_zero_set_mode(&xedd,&dstate);
+    memcpy(new_jump, &new_xedd, sizeof(xed_decoded_inst_t));
+    return 0;
+}
+
 /* ============================================================= */
 /* Translation routines                                         */
 /* ============================================================= */
 
 int add_new_instr_entry(
-    xed_decoded_inst_t *xedd,
+    xed_decoded_inst_t * xedd,
     ADDRINT pc,
     unsigned int size,
-    UINT64 inline_count
-)
+    UINT64 inline_count,
+    bool inserted_inst)
 {
-
     // copy orig instr to instr map:
     ADDRINT orig_targ_addr = 0;
 
-    if (xed_decoded_inst_get_length (xedd) != size) {
+    if (xed_decoded_inst_get_length(xedd) != size) {
         cerr << "Invalid instruction decoding" << endl;
         return -1;
     }
@@ -794,7 +968,7 @@ int add_new_instr_entry(
 
     // add a new entry in the instr_map:
 
-    instr_map[num_of_instr_map_entries].orig_ins_addr = pc;
+    instr_map[num_of_instr_map_entries].orig_ins_addr = inserted_inst ? 0 : pc;
     instr_map[num_of_instr_map_entries].new_ins_addr = (ADDRINT)&tc[tc_cursor];  // set an initial estimated addr in tc
     instr_map[num_of_instr_map_entries].orig_targ_addr = orig_targ_addr;
     instr_map[num_of_instr_map_entries].hasNewTargAddr = false;
@@ -812,7 +986,6 @@ int add_new_instr_entry(
         cerr << "out of memory for map_instr" << endl;
         return -1;
     }
-
 
     // debug print new encoded instr:
     if (KnobVerbose) {
@@ -1178,7 +1351,7 @@ int fix_instructions_displacements()
             if (new_size > 0) { // this was a rip-based instruction which was fixed.
 
                 if (instr_map[i].size != (unsigned int)new_size) {
-                   size_diff += (new_size - instr_map[i].size);
+                   size_diff += new_size - instr_map[i].size;
                    instr_map[i].size = (unsigned int)new_size;
                 }
 
@@ -1347,9 +1520,34 @@ int allocate_and_init_memory(IMG img)
 /* ===================================================================== */
 
 /**
+ * @brief Get the target address for the jump in the instructiin described in the
+ *      given xed instruction.
+ * @param IN    xedd Instruction to parse.
+ * @param OUT   target_addr Address `xedd` jumps to.
+ * @return 0 for success; Other values for failure.
+ */
+int get_inst_target(
+    xed_decoded_inst_t * xedd,
+    ADDRINT ins_addr,
+    ADDRINT * target_addr)
+{
+    xed_uint_t disp_byts = xed_decoded_inst_get_branch_displacement_width(xedd);
+    xed_int32_t disp;
+
+    if (disp_byts <= 0) {
+        cout << "Zut. call with no offset." << endl;
+        return -1;
+    }
+
+    disp = xed_decoded_inst_get_branch_displacement(xedd);
+    *target_addr = ins_addr + xed_decoded_inst_get_length (xedd) + disp;
+    return 0;
+}
+
+/**
  * Add the given `rtn` to the inst_map array, instruction by instruction. If any
  * call in rtn is to an inline target, add those instructions as if they were
- * part of `rtn` (i.e. inline this call).
+ * part of `rtn`(i.e. inline this call).
  *
  * @param IN rtn    Routine to instrument.
  * */
@@ -1364,6 +1562,7 @@ int add_rtn_to_inst_map(RTN rtn)
     ADDRINT ins_addr;
     xed_decoded_inst_t xedd;
     xed_error_enum_t xed_code;
+    ADDRINT target_addr;
 
     // cout << "Adding for translation" << endl; // TODO
 
@@ -1383,6 +1582,16 @@ int add_rtn_to_inst_map(RTN rtn)
 
     while (ins_addr <= rtn_end)
     {
+        // debug print of routine name:
+        if (KnobVerbose)
+        {
+            cerr << "\trtn name: " << RTN_Name(rtn) << " : " << dec << translated_rtn_num;
+            cerr << " : " << hex << rtn_addr;
+            cerr << " : " << hex << RTN_Address(rtn);
+            cerr << " : " << rtn_inline_count[rtn_addr];
+            cerr << "; " << hex << ins_addr << endl;
+        }
+
         xed_decoded_inst_zero_set_mode(&xedd, &dstate);
 
         xed_code = xed_decode(&xedd,
@@ -1403,28 +1612,68 @@ int add_rtn_to_inst_map(RTN rtn)
             cerr << "old instr: ";
             // cerr << "0x" << hex << ins_addr << ": " << INS_Disassemble(ins) << endl;
             dump_instr_from_xedd(&xedd, ins_addr);
-            //xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address (ins)), INS_Size(ins));
+            //xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address(ins)), INS_Size(ins));
         }
 
         skip = false;
 
         xed_category_enum_t category_enum = xed_decoded_inst_get_category(&xedd);
-        if (XED_CATEGORY_CALL == category_enum)
+
+        if (XED_CATEGORY_COND_BR == category_enum)
         {
-            // cout << "found call" << endl; // TODO
-
-            xed_uint_t disp_byts = xed_decoded_inst_get_branch_displacement_width(&xedd);
-            xed_int32_t disp;
-
-            ADDRINT target_addr;
-
-            if (disp_byts <= 0) {
-                cout << "Zut. call with no offset." << endl;
+            rc = get_inst_target(&xedd, ins_addr, &target_addr);
+            if (rc != 0)
+            {
                 return -1;
             }
 
-            disp = xed_decoded_inst_get_branch_displacement(&xedd);
-            target_addr = ins_addr + xed_decoded_inst_get_length (&xedd) + disp;
+            xed_decoded_inst_t new_xedd;
+            int new_size;
+
+            if (reordering_targets.count(target_addr) > 0)
+            {
+                rc = reorder_branch(&xedd, ins_addr, &new_xedd);
+                if (rc != 0)
+                {
+                    cout << "Zut. Failed to reorder at " << std::hex << ins_addr << endl;
+                    return -1;
+                }
+
+                // Add inverted jump to instr map.
+                rc = add_new_instr_entry(&xedd, ins_addr, size,
+                                         rtn_inline_count[rtn_addr],
+                                         false);
+                if (rc < 0)
+                {
+                    cerr << "ERROR: failed during instruction translation." << endl;
+                    translated_rtn[translated_rtn_num].instr_map_entry = -1;
+                    return -1;
+                }
+
+                // Add new jump to instr map.
+                new_size = xed_decoded_inst_get_length(&new_xedd);
+                rc = add_new_instr_entry(&new_xedd, ins_addr, new_size,
+                                         rtn_inline_count[rtn_addr],
+                                         true);
+                if (rc < 0)
+                {
+                    cerr << "ERROR: failed during instruction translation." << endl;
+                    translated_rtn[translated_rtn_num].instr_map_entry = -1;
+                    return -1;
+                }
+
+                skip = true;
+            }
+        }
+        else if (XED_CATEGORY_CALL == category_enum)
+        {
+            // cout << "found call" << endl; // TODO
+
+            rc = get_inst_target(&xedd, ins_addr, &target_addr);
+            if (rc != 0)
+            {
+                return -1;
+            }
 
             if ((inlining_candidates.count(target_addr) > 0) &&
                 (ins_addr == inlining_candidates[target_addr]))
@@ -1450,23 +1699,13 @@ int add_rtn_to_inst_map(RTN rtn)
         {
             // Add instr into instr map:
             rc = add_new_instr_entry(&xedd, ins_addr, size,
-                                     rtn_inline_count[rtn_addr]);
+                                     rtn_inline_count[rtn_addr], false);
             if (rc < 0)
             {
                 cerr << "ERROR: failed during instruction translation." << endl;
                 translated_rtn[translated_rtn_num].instr_map_entry = -1;
                 return -1;
             }
-        }
-
-        // debug print of routine name:
-        if (KnobVerbose)
-        {
-            cerr << "\trtn name: " << RTN_Name(rtn) << " : " << dec << translated_rtn_num;
-            cerr << " : " << hex << rtn_addr;
-            cerr << " : " << hex << RTN_Address(rtn);
-            cerr << " : " << rtn_inline_count[rtn_addr];
-            cerr << "; " << hex << ins_addr << endl;
         }
 
         ins_addr += size;
@@ -1630,14 +1869,13 @@ VOID ImageLoad(IMG img, VOID * v)
 
     cout << "after write all new instructions to memory tc" << endl;
 
-   if (KnobDumpTranslatedCode) {
+    if (KnobDumpTranslatedCode) {
        cerr << "Translation Cache dump:" << endl;
        dump_tc();  // dump the entire tc
 
        cerr << endl << "instructions map dump:" << endl;
        dump_entire_instr_map();     // dump all translated instructions in map_instr
    }
-
 
     // Step 6: Commit the translated routines:
     //Go over the candidate functions and replace the original ones by their new successfully translated ones:
