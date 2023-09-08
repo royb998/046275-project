@@ -156,29 +156,6 @@ INT32 Usage()
     return -1;
 }
 
-/*****************************************/
-/* service functions */
-/*****************************************/
-
-
-template<typename key_type, typename val_type>
-std::pair <val_type, key_type> one_pair_flipper(const std::pair <key_type, val_type> &p)
-{
-    return std::pair<val_type, key_type>(p.second * -1, p.first);
-}
-
-template<typename key_type, typename val_type>
-std::multimap <val_type, key_type> map_flipper(const std::map <key_type, val_type> &src)
-{
-    std::multimap <val_type, key_type> dst;
-    for (const auto &pair: src)
-    {
-        dst.insert(one_pair_flipper(pair));
-    }
-    return dst;
-}
-
-
 /* ============================================================= */
 /* Service dump routines                                         */
 /* ============================================================= */
@@ -574,71 +551,6 @@ int find_inlining_candidates()
     }
 
     return return_value;
-}
-
-int inline_routine(ADDRINT rtn_address, int cursor)
-{
-    INS ins;
-    char inst_bytes[XED_MAX_INSTRUCTION_BYTES] = { 0 };
-    xed_error_enum_t xed_error;
-    unsigned int size;
-
-//    int success_count = 0; // TODO
-
-    RTN rtn = RTN_FindByAddress(rtn_address);
-
-    if (!RTN_Valid(rtn))
-    {
-        cout << "Zut. Invalid rtn for inline at 0x" << std::hex
-             << rtn_address << endl;
-        cursor = -1;
-        goto l_cleanup;
-    }
-
-    RTN_Open(rtn);
-
-    ins = RTN_InsHead(rtn);
-
-    while (!INS_IsRet(ins))
-    {
-        if (!INS_Valid(ins))
-        {
-            cout << "Zut. Invalid instruction at inlined rtn at 0x" << std::hex
-                 << rtn_address << endl;
-            cursor = -1;
-            goto l_cleanup;
-        }
-        xed_decoded_inst_t * xed_inst = INS_XedDec(ins);
-
-        // Converts the decoder request to a valid encoder request:
-        xed_encoder_request_init_from_decode (xed_inst);
-
-        xed_error = xed_encode(xed_inst,
-                               (UINT8*)inst_bytes,
-                               XED_MAX_INSTRUCTION_BYTES,
-                               &size);
-        if (xed_error != XED_ERROR_NONE) {
-            cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;
-//            cerr << "Managed to encode " << success_count << endl; // TODO
-            for (int i = 0; i < XED_MAX_INSTRUCTION_BYTES; ++i)
-            {
-                cout << " " << std::hex << inst_bytes[i];
-            }
-            cout << endl;
-            cursor = -1;
-            goto l_cleanup;
-        }
-
-        memcpy(&tc[cursor], &inst_bytes, size);
-        cursor += size;
-
-//        success_count++;
-        ins = INS_Next(ins);
-    }
-
-l_cleanup:
-    RTN_Close(rtn);
-    return cursor;
 }
 
 /* ============================================================= */
