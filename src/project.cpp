@@ -37,11 +37,11 @@ using std::ofstream;
 /* Constants                                                             */
 /* ===================================================================== */
 
+const float HOT_BRANCH_THRESH = 0.9;
 const float HOT_CALL_THRESH = 0.9;
-const float HOT_LOOP_THRESH = 0.7;
 const int HOT_CALL_MIN_COUNT = 2;
 
-const std::string loop_profile = "loop-count.csv";
+const std::string branch_profile = "branch-count.csv";
 const std::string rtn_profile = "rtn-count.csv";
 
 /* ===================================================================== */
@@ -51,20 +51,19 @@ const std::string rtn_profile = "rtn-count.csv";
 typedef struct
 {
     UINT64 count_seen;
-    UINT64 count_invoked;
+    UINT64 count_taken;
     ADDRINT rtn_addr;
     string rtn_name;
-    ADDRINT loop_target_addr;
-    UINT64 curr_iter_num;
-    UINT64 prev_iter_num;
-    UINT64 diff_count;
-} LOOP_DATA;
+    ADDRINT target_addr;
+} branch_data;
 
-map<ADDRINT, LOOP_DATA> loops;
+map<ADDRINT, branch_data> branches;
+
 map<ADDRINT, UINT64> rtn_ins_counts;
 map<ADDRINT, UINT64> rtn_call_counts;
 map<ADDRINT, map<ADDRINT, UINT64>> caller_count;
 map<ADDRINT, ADDRINT> rtn_callers;
+
 map<ADDRINT, ADDRINT> inlining_candidates;
 map<ADDRINT, UINT64> rtn_inline_count;
 map<ADDRINT, float> loop_heat;
@@ -106,11 +105,9 @@ typedef struct
     UINT64 inline_count;
 } instr_map_t;
 
-
 instr_map_t * instr_map = NULL;
 int num_of_instr_map_entries = 0;
 int max_ins_count = 0;
-
 
 // total number of routines in the main executable module:
 int max_rtn_count = 0;
@@ -316,27 +313,10 @@ VOID /*PIN_FAST_ANALYSIS_CALL*/ count_rtn_ins(uint32_t* counter, uint32_t amount
     (*counter) += amount;
 }
 
-VOID count_branch(ADDRINT loop_addr, bool is_taken)
+VOID count_branch(ADDRINT branch_addr, bool is_taken)
 {
-    int cur_iter = loops[loop_addr].curr_iter_num;
-    int prev_iter = loops[loop_addr].prev_iter_num;
-
-    loops[loop_addr].count_seen++;
-
-    if (is_taken)
-    {
-        cur_iter++;
-    }
-    else
-    {
-        loops[loop_addr].count_invoked++;
-        loops[loop_addr].diff_count += (int)(cur_iter != prev_iter);
-        prev_iter = cur_iter;
-        cur_iter = 0;
-    }
-
-    loops[loop_addr].curr_iter_num = cur_iter;
-    loops[loop_addr].prev_iter_num = prev_iter;
+    branches[branch_addr].count_seen++;
+    branches[branch_addr].count_taken += is_taken ? 1 : 0;
 }
 
 VOID count_rtn_call(ADDRINT addr)
@@ -401,16 +381,13 @@ VOID Trace(TRACE trace, VOID* v)
             {
                 target_addr = INS_DirectControlFlowTargetAddress(ins_tail);
 
-                if (target_addr < ins_tail_addr)
-                {
-                    loops[target_addr].rtn_addr = RTN_Address(curr_rtn);
-                    loops[target_addr].rtn_name = rtn_name;
-                    loops[target_addr].loop_target_addr = target_addr;
+                branches[ins_tail_addr].rtn_addr = RTN_Address(curr_rtn);
+                branches[ins_tail_addr].rtn_name = rtn_name;
+                branches[ins_tail_addr].target_addr = target_addr;
 
-                    INS_InsertCall(ins_tail, IPOINT_BEFORE, (AFUNPTR)count_branch,
-                                   IARG_ADDRINT, target_addr,
-                                   IARG_BRANCH_TAKEN, IARG_END);
-                }
+                INS_InsertCall(ins_tail, IPOINT_BEFORE, (AFUNPTR)count_branch,
+                               IARG_ADDRINT, ins_tail_addr,
+                               IARG_BRANCH_TAKEN, IARG_END);
             }
         }
 
@@ -526,7 +503,7 @@ int is_valid_for_inlining(RTN rtn)
             goto l_cleanup;
         }
 
-        // Do not inline functions that jumps outside of its own scope.
+        // Do not inline functions that jumps outside its own scope.
         if (INS_IsBranch(ins))
         {
             target_addr = INS_DirectControlFlowTargetAddress(ins);
@@ -673,11 +650,11 @@ l_cleanup:
  * */
 void load_reordering_candidates()
 {
-    ifstream csv_file(loop_profile);
+    ifstream csv_file(branch_profile);
 
     if (!csv_file.good())
     {
-        cout << "Zut. can't open " << loop_profile << endl;
+        cout << "Zut. can't open " << branch_profile << endl;
         exit(1);
     }
 
@@ -700,8 +677,8 @@ void load_reordering_candidates()
             float count_taken = strtof(split_line[2].c_str(),
                                        nullptr);
 
-            ADDRINT loop_addr = strtol(split_line[0].c_str(),
-                                       nullptr, 16) + main_image_addr;
+            ADDRINT branch_addr = strtol(split_line[0].c_str(),
+                                         nullptr, 16) + main_image_addr;
             float percent_taken = count_taken / count_seen;
 
             if (percent_taken > 1)
@@ -710,7 +687,7 @@ void load_reordering_candidates()
                 continue;
             }
 
-            loop_heat[loop_addr] = percent_taken;
+            loop_heat[branch_addr] = percent_taken;
         }
 
         csv_file.close();
@@ -736,7 +713,7 @@ int find_reordering_targets()
             continue;
         }
 
-        if (pair.second < HOT_LOOP_THRESH)
+        if (pair.second < HOT_BRANCH_THRESH)
         {
 //            cout << "Zut. Cold at " << std::hex << pair.first << endl; // TODO
             continue;
@@ -1455,7 +1432,6 @@ int allocate_and_init_memory(IMG img)
         if (!SEC_IsExecutable(sec) || SEC_IsWriteable(sec) || !SEC_Address(sec))
             continue;
 
-
         if (!lowest_sec_addr || lowest_sec_addr > SEC_Address(sec))
             lowest_sec_addr = SEC_Address(sec);
 
@@ -1469,7 +1445,7 @@ int allocate_and_init_memory(IMG img)
             if (rtn == RTN_Invalid())
                 continue;
 
-            max_ins_count += RTN_NumIns  (rtn);
+            max_ins_count += RTN_NumIns(rtn);
             max_rtn_count++;
         }
     }
@@ -1667,8 +1643,6 @@ int add_rtn_to_inst_map(RTN rtn)
         }
         else if (XED_CATEGORY_CALL == category_enum)
         {
-            // cout << "found call" << endl; // TODO
-
             rc = get_inst_target(&xedd, ins_addr, &target_addr);
             if (rc != 0)
             {
@@ -1709,7 +1683,7 @@ int add_rtn_to_inst_map(RTN rtn)
         }
 
         ins_addr += size;
-    } // end for INS...
+    }
 
     return 0;
 }
@@ -1786,24 +1760,6 @@ int find_candidate_rtns_for_translation(IMG img)
     {
         return rc;
     }
-
-/*
-    for (SEC sec = IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec))
-    {
-        if (!SEC_IsExecutable(sec) || SEC_IsWriteable(sec) || !SEC_Address(sec))
-            continue;
-
-        for (RTN rtn = SEC_RtnHead(sec); RTN_Valid(rtn); rtn = RTN_Next(rtn))
-        {
-
-            if (rtn == RTN_Invalid()) {
-                cerr << "Warning: invalid routine " << RTN_Name(rtn) << endl;
-                continue;
-            }
-            add_rtn_for_translation(rtn);
-        } // end for RTN..
-    } // end for SEC...
-*/
 
     for (const auto &pair : inlining_candidates)
     {
@@ -1892,36 +1848,32 @@ VOID Fini(INT32 code, VOID* v)
 {
     ADDRINT rtn_address;
 
-    ofstream to(loop_profile);
+    ofstream to(branch_profile);
     if (!to)
     {
-        cerr << "ERROR, can't open file: " << loop_profile << endl;
+        cerr << "ERROR, can't open file: " << branch_profile << endl;
         return;
     }
 
-    std::multimap<UINT32, LOOP_DATA> sorted_loops_map;
+    /*std::multimap<UINT32, branch_data> sorted_loops_map;
 
-    for (std::map<ADDRINT, LOOP_DATA>::const_iterator it = loops.begin(); it != loops.end(); ++it)
+    for (std::map<ADDRINT, branch_data>::const_iterator it = branches.begin(); it != branches.end(); ++it)
     {
-        sorted_loops_map.insert(std::pair<UINT32, LOOP_DATA>(it->second.count_seen * -1, it->second));
-    }
+        sorted_loops_map.insert(std::pair<UINT32, branch_data>(it->second.count_seen * -1, it->second));
+    }*/
 
-    for (std::multimap<UINT32, LOOP_DATA>::const_iterator it = sorted_loops_map.begin();
-         it != sorted_loops_map.end(); ++it)
+    for (auto &it : branches)
     {
-        rtn_address = it->second.rtn_addr;
+        rtn_address = it.second.rtn_addr;
 
-        if (it->second.count_seen > 0 && it->second.count_invoked > 0)
+        if (it.second.count_seen > 0 && it.second.count_taken > 0)
         {
-            to << "0x" << std::hex << it->second.loop_target_addr - main_image_addr
-               << ", " << std::dec << it->second.count_seen
-               << ", " << it->second.count_invoked
-               << ", " << std::dec << it->second.count_seen / (double)it->second.count_invoked
-               << ", " << it->second.diff_count
-               << ", " << it->second.rtn_name
+            to << "0x" << std::hex << it.first - main_image_addr
+               << ", " << std::dec << it.second.count_seen
+               << ", " << it.second.count_taken
+               << ", " << std::dec << (float)it.second.count_taken / (float)it.second.count_seen
+               << ", " << it.second.rtn_name
                << ", " << "0x" << std::hex << (rtn_address - main_image_addr)
-               << ", " << std::dec << rtn_ins_counts[rtn_address]
-               << ", " << std::dec << rtn_call_counts[rtn_address]
                << endl;
         }
     }
