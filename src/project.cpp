@@ -202,7 +202,9 @@ void dump_instr_from_mem (ADDRINT *address, ADDRINT new_addr)
 
   xed_decoded_inst_zero_set_mode(&new_xedd,&dstate);
 
-  xed_error_enum_t xed_code = xed_decode(&new_xedd, reinterpret_cast<UINT8*>(address), max_inst_len);
+  xed_error_enum_t xed_code = xed_decode(&new_xedd,
+                                         reinterpret_cast<UINT8*>(address),
+                                         max_inst_len);
 
   BOOL xed_ok = (xed_code == XED_ERROR_NONE);
   if (!xed_ok){
@@ -210,7 +212,8 @@ void dump_instr_from_mem (ADDRINT *address, ADDRINT new_addr)
       return;
   }
 
-  xed_format_context(XED_SYNTAX_INTEL, &new_xedd, disasm_buf, 2048, static_cast<UINT64>(new_addr), 0, 0);
+  xed_format_context(XED_SYNTAX_INTEL, &new_xedd, disasm_buf, 2048,
+                     static_cast<UINT64>(new_addr), 0, 0);
 
   cerr << "0x" << hex << new_addr << ": " << disasm_buf <<  endl;
 }
@@ -254,38 +257,41 @@ void dump_instr_map_entry(int instr_map_entry)
 
 void dump_tc()
 {
-  char disasm_buf[2048];
-  xed_decoded_inst_t new_xedd;
-  ADDRINT address = (ADDRINT)&tc[0];
-  unsigned int size = 0;
+    char disasm_buf[2048];
+    xed_decoded_inst_t new_xedd;
+    ADDRINT address;
+    unsigned int size = 0;
 
-  while (address < (ADDRINT)&tc[tc_cursor]) {
+    address = (ADDRINT)&tc[0];
 
-      address += size;
+    while (address < (ADDRINT)&tc[tc_cursor])
+    {
+        address += size;
 
-      xed_decoded_inst_zero_set_mode(&new_xedd,&dstate);
+        xed_decoded_inst_zero_set_mode(&new_xedd, &dstate);
 
-      xed_error_enum_t xed_code = xed_decode(&new_xedd, reinterpret_cast<UINT8*>(address), max_inst_len);
+        xed_error_enum_t xed_code = xed_decode(&new_xedd, reinterpret_cast<UINT8 *>(address), max_inst_len);
 
-      BOOL xed_ok = (xed_code == XED_ERROR_NONE);
-      if (!xed_ok){
-          cerr << "invalid opcode" << endl;
-          return;
-      }
+        BOOL xed_ok = (xed_code == XED_ERROR_NONE);
+        if (!xed_ok)
+        {
+            cerr << "invalid opcode" << endl;
+            return;
+        }
 
-      xed_format_context(XED_SYNTAX_INTEL, &new_xedd, disasm_buf, 2048, static_cast<UINT64>(address), 0, 0);
+        xed_format_context(XED_SYNTAX_INTEL, &new_xedd, disasm_buf, 2048, static_cast<UINT64>(address), 0, 0);
 
-      cerr << "0x" << hex << address << ": " << disasm_buf <<  endl;
+        cerr << "0x" << hex << address << ": " << disasm_buf << endl;
 
-      size = xed_decoded_inst_get_length(&new_xedd);
-  }
+        size = xed_decoded_inst_get_length(&new_xedd);
+    }
 }
 
 /* ===================================================================== */
 /*Call functions*/
 /* ===================================================================== */
 
-VOID /*PIN_FAST_ANALYSIS_CALL*/ count_rtn_ins(uint32_t* counter, uint32_t amount)
+VOID count_rtn_ins(uint32_t* counter, uint32_t amount)
 {
     (*counter) += amount;
 }
@@ -773,7 +779,6 @@ int reorder_branch(
               XED_ICLASS_JMP, 64,
               xed_relbr(disp - 3, 32));
 //              xed_relbr(disp - new_size, 32));
-
     xed_encoder_request_t enc_req;
 
     xed_encoder_request_zero_set_mode(&enc_req, &dstate);
@@ -1437,7 +1442,7 @@ int get_inst_target(
  * call in rtn is to an inline target, add those instructions as if they were
  * part of `rtn`(i.e. inline this call).
  *
- * @param IN rtn    Routine to instrument.
+ * @param rtn IN    Routine to instrument.
  * */
 int add_rtn_to_inst_map(RTN rtn)
 {
@@ -1452,9 +1457,7 @@ int add_rtn_to_inst_map(RTN rtn)
     xed_error_enum_t xed_code;
     ADDRINT target_addr;
 
-    // cout << "Adding for translation" << endl; // TODO
-
-    // Get routine boundries.
+    // Get routine boundaries.
     RTN_Open(rtn);
     head = RTN_InsHead(rtn);
     rtn_end = INS_Address(RTN_InsTail(rtn));
@@ -1811,7 +1814,7 @@ VOID Fini(INT32 code, VOID* v)
             UINT64 current_count = iter.second;
 
             if ((current_count < HOT_CALL_MIN_COUNT) ||
-                ((float)current_count / rtn_call_counts[pair.first] < HOT_CALL_THRESH))
+                ((float)current_count / (float)rtn_call_counts[pair.first] < HOT_CALL_THRESH))
             {
                 continue;
             }
