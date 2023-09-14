@@ -37,8 +37,8 @@ using std::ofstream;
 /* Constants                                                             */
 /* ===================================================================== */
 
-const float HOT_BRANCH_THRESH = 0.9;
-const float HOT_CALL_THRESH = 0.9;
+const float HOT_BRANCH_THRESH = 0.6;
+const float HOT_CALL_THRESH = 0.6;
 const int HOT_CALL_MIN_COUNT = 2;
 
 const std::string branch_profile = "branch-count.csv";
@@ -66,9 +66,9 @@ map<ADDRINT, ADDRINT> rtn_callers;
 
 map<ADDRINT, ADDRINT> inlining_candidates;
 map<ADDRINT, UINT64> rtn_inline_count;
-map<ADDRINT, float> loop_heat;
+map<ADDRINT, float> branch_heat;
 map<ADDRINT, ADDRINT> reordering_targets;
-
+set<ADDRINT> skipped_routines;
 
 // For XED:
 #if defined(TARGET_IA32E)
@@ -135,6 +135,9 @@ KNOB <BOOL> prof_mode(KNOB_MODE_WRITEONCE, "pintool", "prof", "0",
 KNOB <BOOL> opt_mode(KNOB_MODE_WRITEONCE, "pintool", "opt", "0",
                       "Run in optimization mode");
 
+KNOB <BOOL> knob_debug(KNOB_MODE_WRITEONCE, "pintool", "debug", "0",
+                      "Add debug prints");
+
 KNOB <BOOL> KnobVerbose(KNOB_MODE_WRITEONCE, "pintool",
                         "verbose", "0", "Verbose run");
 
@@ -183,7 +186,7 @@ void dump_all_image_instrs(IMG img)
     }
 }
 
-void dump_instr_from_xedd (xed_decoded_inst_t* xedd, ADDRINT address)
+void dump_instr_from_xedd(xed_decoded_inst_t* xedd, ADDRINT address)
 {
     // debug print decoded instr:
     char disasm_buf[2048];
@@ -195,7 +198,7 @@ void dump_instr_from_xedd (xed_decoded_inst_t* xedd, ADDRINT address)
     cerr << hex << address << ": " << disasm_buf <<  endl;
 }
 
-void dump_instr_from_mem (ADDRINT *address, ADDRINT new_addr)
+void dump_instr_from_mem(ADDRINT *address, ADDRINT new_addr)
 {
   char disasm_buf[2048];
   xed_decoded_inst_t new_xedd;
@@ -499,7 +502,6 @@ int is_valid_for_inlining(RTN rtn)
 
         if (INS_IsSub(ins) && INS_RegWContain(ins, REG::REG_RSP))
         {
-//            cout << INS_Disassemble(ins) << endl; // TODO
             return_value = 6;
             goto l_cleanup;
         }
@@ -525,7 +527,7 @@ int is_valid_for_inlining(RTN rtn)
 
 l_cleanup:
     RTN_Close(rtn);
-    return return_value; // TODO: rv <= 6
+    return return_value;
 }
 
 int find_inlining_candidates()
@@ -539,21 +541,30 @@ int find_inlining_candidates()
 
         if (!RTN_Valid(callee))
         {
-//            cout << "Zut. Invalid. " << endl; // TODO
+            if (knob_debug)
+            {
+                cout << "Zut. Received invalid routine to inline." << endl;
+            }
             continue;
         }
 
         return_value = is_valid_for_inlining(callee);
         if (return_value != 0)
         {
-//            cout << "Zut. rc " << return_value << " " << endl; // TODO
+            if (knob_debug)
+            {
+                cout << "Zut. Routine can't be inlined (" << return_value << ")." << endl;
+            }
             continue;
         }
 
         inlining_candidates[pair.first] = pair.second;
         return_value = 0;
 
-//         cout << std::hex << pair.first << " " << pair.second << " valid" << endl; // TODO
+        if (knob_debug)
+        {
+            cout << "Yay! " << hex << pair.first << " " << pair.second << " valid" << endl;
+        }
     }
 
     return return_value;
@@ -601,11 +612,14 @@ void load_reordering_candidates()
 
             if (percent_taken > 1)
             {
-                cout << "Zut. Bad count." << endl; // TODO
+                if (knob_debug)
+                {
+                    cout << "Zut. Bad count." << endl;
+                }
                 continue;
             }
 
-            loop_heat[branch_addr] = percent_taken;
+            branch_heat[branch_addr] = percent_taken;
         }
 
         csv_file.close();
@@ -621,19 +635,21 @@ int find_reordering_targets()
     int return_value = -1;
     RTN target_routine;
 
-    for (const auto &pair : loop_heat)
+    for (const auto &pair : branch_heat)
     {
         target_routine = RTN_FindByAddress(pair.first);
 
         if (!RTN_Valid(target_routine))
         {
-            cout << "Zut. Invalid loop " << std::hex << pair.first << endl; // TODO
+            if (knob_debug)
+            {
+                cout << "Zut. Invalid branch " << std::hex << pair.first << endl;
+            }
             continue;
         }
 
         if (pair.second < HOT_BRANCH_THRESH)
         {
-//            cout << "Zut. Cold at " << std::hex << pair.first << endl; // TODO
             continue;
         }
 
@@ -843,17 +859,17 @@ int add_new_instr_entry(
 
     if (disp_byts > 0) { // there is a branch offset.
       disp = xed_decoded_inst_get_branch_displacement(xedd);
-      orig_targ_addr = pc + xed_decoded_inst_get_length (xedd) + disp;
+      orig_targ_addr = pc + xed_decoded_inst_get_length(xedd) + disp;
     }
 
     // Converts the decoder request to a valid encoder request:
-    xed_encoder_request_init_from_decode (xedd);
+    xed_encoder_request_init_from_decode(xedd);
 
     unsigned int new_size = 0;
 
     xed_error_enum_t xed_error = xed_encode(
         xedd,
-        reinterpret_cast<UINT8*>(instr_map[num_of_instr_map_entries].encoded_ins),
+        (xed_uint8_t *)(instr_map[num_of_instr_map_entries].encoded_ins),
         max_inst_len , &new_size);
     if (xed_error != XED_ERROR_NONE) {
         cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;
@@ -915,7 +931,10 @@ int find_target_entry(int src_entry_index)
 
             if (src_entry->hasNewTargAddr)
             {
-                cout << "Zut. One source multiple targets." << endl;
+                if (knob_debug)
+                {
+                    cout << "Zut. One source multiple targets." << endl;
+                }
                 continue;
             }
 
@@ -929,9 +948,7 @@ int find_target_entry(int src_entry_index)
 
 int chain_all_direct_br_and_call_target_entries()
 {
-//    int return_value = 0;
-
-//    cout << "Entry count " << num_of_instr_map_entries << endl; // TODO
+    int return_value = 0;
 
     for (int i=0; i < num_of_instr_map_entries; i++) {
 
@@ -942,11 +959,11 @@ int chain_all_direct_br_and_call_target_entries()
             continue;
 
         find_target_entry(i);
-        /*return_value = find_target_entry(i);
-        if (return_value != 0)
+        return_value = find_target_entry(i);
+        if (return_value != 0 && knob_debug)
         {
-            cout << "Zut. Source w/o target." << endl; // TODO
-        }*/
+            cout << "Zut. Source w/o target." << endl;
+        }
     }
 
     return 0;
@@ -995,22 +1012,22 @@ int fix_rip_displacement(int instr_map_entry)
     xed_int64_t new_disp = 0;
     xed_uint_t new_disp_byts = 4;   // set maximal num of byts for now.
 
-    unsigned int orig_size = xed_decoded_inst_get_length (&xedd);
+    unsigned int orig_size = xed_decoded_inst_get_length(&xedd);
 
     // modify rip displacement. use direct addressing mode:
     new_disp = instr_map[instr_map_entry].orig_ins_addr + disp + orig_size; // xed_decoded_inst_get_length (&xedd_orig);
-    xed_encoder_request_set_base0 (&xedd, XED_REG_INVALID);
+    xed_encoder_request_set_base0(&xedd, XED_REG_INVALID);
 
     //Set the memory displacement using a bit length
-    xed_encoder_request_set_memory_displacement (&xedd, new_disp, new_disp_byts);
+    xed_encoder_request_set_memory_displacement(&xedd, new_disp, new_disp_byts);
 
     unsigned int size = XED_MAX_INSTRUCTION_BYTES;
     unsigned int new_size = 0;
 
     // Converts the decoder request to a valid encoder request:
-    xed_encoder_request_init_from_decode (&xedd);
+    xed_encoder_request_init_from_decode(&xedd);
 
-    xed_error_enum_t xed_error = xed_encode (&xedd, reinterpret_cast<UINT8*>(instr_map[instr_map_entry].encoded_ins), size , &new_size); // &instr_map[i].size
+    xed_error_enum_t xed_error = xed_encode(&xedd, reinterpret_cast<UINT8*>(instr_map[instr_map_entry].encoded_ins), size , &new_size); // &instr_map[i].size
     if (xed_error != XED_ERROR_NONE) {
         cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;
         dump_instr_map_entry(instr_map_entry);
@@ -1058,17 +1075,17 @@ int fix_direct_br_call_to_orig_addr(int instr_map_entry)
 
     ADDRINT new_disp = (ADDRINT)&instr_map[instr_map_entry].orig_targ_addr -
                        instr_map[instr_map_entry].new_ins_addr -
-                       xed_decoded_inst_get_length (&xedd);
+                       xed_decoded_inst_get_length(&xedd);
 
     if (category_enum == XED_CATEGORY_CALL)
             xed_inst1(&enc_instr, dstate,
             XED_ICLASS_CALL_NEAR, 64,
-            xed_mem_bd (XED_REG_RIP, xed_disp(new_disp, 32), 64));
+            xed_mem_bd(XED_REG_RIP, xed_disp(new_disp, 32), 64));
 
     if (category_enum == XED_CATEGORY_UNCOND_BR)
             xed_inst1(&enc_instr, dstate,
             XED_ICLASS_JMP, 64,
-            xed_mem_bd (XED_REG_RIP, xed_disp(new_disp, 32), 64));
+            xed_mem_bd(XED_REG_RIP, xed_disp(new_disp, 32), 64));
 
 
     xed_encoder_request_t enc_req;
@@ -1089,7 +1106,7 @@ int fix_direct_br_call_to_orig_addr(int instr_map_entry)
     }
 
     // handle the case where the original instr size is different from new encoded instr:
-    if (olen != xed_decoded_inst_get_length (&xedd)) {
+    if (olen != xed_decoded_inst_get_length(&xedd)) {
 
         new_disp = (ADDRINT)&instr_map[instr_map_entry].orig_targ_addr -
                    instr_map[instr_map_entry].new_ins_addr - olen;
@@ -1097,12 +1114,12 @@ int fix_direct_br_call_to_orig_addr(int instr_map_entry)
         if (category_enum == XED_CATEGORY_CALL)
             xed_inst1(&enc_instr, dstate,
             XED_ICLASS_CALL_NEAR, 64,
-            xed_mem_bd (XED_REG_RIP, xed_disp(new_disp, 32), 64));
+            xed_mem_bd(XED_REG_RIP, xed_disp(new_disp, 32), 64));
 
         if (category_enum == XED_CATEGORY_UNCOND_BR)
             xed_inst1(&enc_instr, dstate,
             XED_ICLASS_JMP, 64,
-            xed_mem_bd (XED_REG_RIP, xed_disp(new_disp, 32), 64));
+            xed_mem_bd(XED_REG_RIP, xed_disp(new_disp, 32), 64));
 
 
         xed_encoder_request_zero_set_mode(&enc_req, &dstate);
@@ -1112,7 +1129,7 @@ int fix_direct_br_call_to_orig_addr(int instr_map_entry)
             return -1;
         }
 
-        xed_error = xed_encode (&enc_req, reinterpret_cast<UINT8*>(instr_map[instr_map_entry].encoded_ins), ilen , &olen);
+        xed_error = xed_encode(&enc_req, reinterpret_cast<UINT8*>(instr_map[instr_map_entry].encoded_ins), ilen , &olen);
         if (xed_error != XED_ERROR_NONE) {
             cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;
             dump_instr_map_entry(instr_map_entry);
@@ -1132,7 +1149,6 @@ int fix_direct_br_call_to_orig_addr(int instr_map_entry)
 
 int fix_direct_br_call_displacement(int instr_map_entry)
 {
-
     xed_decoded_inst_t xedd;
     xed_decoded_inst_zero_set_mode(&xedd,&dstate);
 
@@ -1148,7 +1164,9 @@ int fix_direct_br_call_displacement(int instr_map_entry)
 
     xed_category_enum_t category_enum = xed_decoded_inst_get_category(&xedd);
 
-    if (category_enum != XED_CATEGORY_CALL && category_enum != XED_CATEGORY_COND_BR && category_enum != XED_CATEGORY_UNCOND_BR) {
+    if (category_enum != XED_CATEGORY_CALL &&
+        category_enum != XED_CATEGORY_COND_BR &&
+        category_enum != XED_CATEGORY_UNCOND_BR) {
         cerr << "ERROR: unrecognized branch displacement" << endl;
         return -1;
     }
@@ -1168,26 +1186,28 @@ int fix_direct_br_call_displacement(int instr_map_entry)
 
     // the max displacement size of loop instructions is 1 byte:
     xed_iclass_enum_t iclass_enum = xed_decoded_inst_get_iclass(&xedd);
-    if (iclass_enum == XED_ICLASS_LOOP ||  iclass_enum == XED_ICLASS_LOOPE || iclass_enum == XED_ICLASS_LOOPNE) {
+    if (iclass_enum == XED_ICLASS_LOOP ||
+        iclass_enum == XED_ICLASS_LOOPE ||
+        iclass_enum == XED_ICLASS_LOOPNE) {
       new_disp_byts = 1;
     }
 
     // the max displacement size of jecxz instructions is ???:
-    xed_iform_enum_t iform_enum = xed_decoded_inst_get_iform_enum (&xedd);
+    xed_iform_enum_t iform_enum = xed_decoded_inst_get_iform_enum(&xedd);
     if (iform_enum == XED_IFORM_JRCXZ_RELBRb){
       new_disp_byts = 1;
     }
 
     // Converts the decoder request to a valid encoder request:
-    xed_encoder_request_init_from_decode (&xedd);
+    xed_encoder_request_init_from_decode(&xedd);
 
     //Set the branch displacement:
-    xed_encoder_request_set_branch_displacement (&xedd, new_disp, new_disp_byts);
+    xed_encoder_request_set_branch_displacement(&xedd, new_disp, new_disp_byts);
 
     xed_uint8_t enc_buf[XED_MAX_INSTRUCTION_BYTES];
     unsigned int max_size = XED_MAX_INSTRUCTION_BYTES;
 
-    xed_error_enum_t xed_error = xed_encode (&xedd, enc_buf, max_size , &new_size);
+    xed_error_enum_t xed_error = xed_encode(&xedd, enc_buf, max_size , &new_size);
     if (xed_error != XED_ERROR_NONE) {
         cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) <<  endl;
         char buf[2048];
@@ -1201,9 +1221,9 @@ int fix_direct_br_call_displacement(int instr_map_entry)
     new_disp = new_targ_addr - (instr_map[instr_map_entry].new_ins_addr + new_size);  // this is the correct displacemnet.
 
     //Set the branch displacement:
-    xed_encoder_request_set_branch_displacement (&xedd, new_disp, new_disp_byts);
+    xed_encoder_request_set_branch_displacement(&xedd, new_disp, new_disp_byts);
 
-    xed_error = xed_encode (&xedd, reinterpret_cast<UINT8*>(instr_map[instr_map_entry].encoded_ins), size , &new_size); // &instr_map[i].size
+    xed_error = xed_encode(&xedd, reinterpret_cast<UINT8*>(instr_map[instr_map_entry].encoded_ins), size , &new_size); // &instr_map[i].size
     if (xed_error != XED_ERROR_NONE) {
         cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;
         dump_instr_map_entry(instr_map_entry);
@@ -1333,7 +1353,7 @@ inline void commit_translated_routines()
                     cerr << " orig routine addr: 0x" << hex << translated_rtn[i].rtn_addr
                             << " replacement routine addr: 0x" << hex << instr_map[translated_rtn[i].instr_map_entry].new_ins_addr << endl;
 
-                    dump_instr_from_mem ((ADDRINT *)translated_rtn[i].rtn_addr, translated_rtn[i].rtn_addr);
+                    dump_instr_from_mem((ADDRINT *)translated_rtn[i].rtn_addr, translated_rtn[i].rtn_addr);
                 }
             }
         }
@@ -1428,12 +1448,15 @@ int get_inst_target(
     xed_int32_t disp;
 
     if (disp_byts <= 0) {
-        cout << "Zut. call with no offset." << endl;
+        if (knob_debug)
+        {
+            cout << "Zut. call with no offset." << endl;
+        }
         return -1;
     }
 
     disp = xed_decoded_inst_get_branch_displacement(xedd);
-    *target_addr = ins_addr + xed_decoded_inst_get_length (xedd) + disp;
+    *target_addr = ins_addr + xed_decoded_inst_get_length(xedd) + disp;
     return 0;
 }
 
@@ -1526,7 +1549,10 @@ int add_rtn_to_inst_map(RTN rtn)
                 rc = reorder_branch(&xedd, ins_addr, &new_xedd);
                 if (rc != 0)
                 {
-                    cout << "Zut. Failed to reorder at " << std::hex << ins_addr << endl;
+                    if (knob_debug)
+                    {
+                        cout << "Zut. Failed to reorder at " << std::hex << ins_addr << endl;
+                    }
                     return -1;
                 }
 
@@ -1567,11 +1593,23 @@ int add_rtn_to_inst_map(RTN rtn)
             if ((inlining_candidates.count(target_addr) > 0) &&
                 (ins_addr == inlining_candidates[target_addr]))
             {
+                if (knob_debug)
+                {
+                    cout << "Found candidate " << hex << target_addr <<
+                         " -> " << ins_addr << endl;
+                }
                 rc = add_rtn_to_inst_map(RTN_FindByAddress(target_addr));
                 if (rc != 0)
                 {
-                    cout << "Zut. failed to inline." << endl;
+                    if (knob_debug)
+                    {
+                        cout << "Zut. failed to inline." << endl;
+                    }
                     return -1;
+                }
+                else if (knob_debug)
+                {
+                    cout << "Yay! Succeeded inline! " << num_of_instr_map_entries << endl;
                 }
 
                 rtn_inline_count[target_addr]++;
@@ -1630,8 +1668,12 @@ void add_rtn_for_translation(RTN rtn)
     rc = add_rtn_to_inst_map(rtn);
     if (rc != 0)
     {
-        cout << "Zut. Failed to add routine " << std::hex << RTN_Address(rtn)
-             << " " << RTN_Name(rtn) << " " << rc << endl;
+        skipped_routines.insert(rtn_address);
+        if (knob_debug)
+        {
+            cout << "Zut. Failed to add routine " << std::hex << RTN_Address(rtn)
+                 << " " << RTN_Name(rtn) << " " << rc << endl;
+        }
         // Backup after failure to translate, as if the routine was never translated.
         tc_cursor = tc_saved;
         num_of_instr_map_entries = current_entry_count;
@@ -1650,13 +1692,28 @@ int find_candidate_rtns_for_translation(IMG img)
     // Find candidates for reordering.
     load_reordering_candidates();
     rc = find_reordering_targets();
-//    if (rc != 0)
-//    {
-//        return rc; // TODO
-//    }
-
-    for (auto &pair : reordering_targets)
+    if (rc != 0 && knob_debug)
     {
+        cout << "Zut. No target was chosen for reordering." << endl;
+    }
+
+    // Find candidates for inlining.
+    load_inlining_candidates();
+    rc = find_inlining_candidates();
+    if (rc != 0 && knob_debug)
+    {
+        cout << "Zut. No routine was chosen for inlining." << endl;
+    }
+
+    // Go over all chosen routines and translate them.
+
+    for (const auto &pair : inlining_candidates)
+    {
+        if (skipped_routines.count(pair.second) > 0)
+        {
+            continue;
+        }
+
         target = RTN_FindByAddress(pair.second);
 
         if (!RTN_Valid(target))
@@ -1668,17 +1725,14 @@ int find_candidate_rtns_for_translation(IMG img)
         add_rtn_for_translation(target);
     }
 
-    // Find candidates for inlining.
-    load_inlining_candidates();
-    rc = find_inlining_candidates();
-    if (rc != 0)
-    {
-        return rc;
-    }
-
-    for (const auto &pair : inlining_candidates)
+    for (auto &pair : reordering_targets)
     {
         target = RTN_FindByAddress(pair.second);
+
+        if (skipped_routines.count(RTN_Address(target)) > 0)
+        {
+            continue;
+        }
 
         if (!RTN_Valid(target))
         {
@@ -1758,7 +1812,6 @@ VOID ImageLoad(IMG img, VOID * v)
 
 /* ===================================================================== */
 
-
 VOID Fini(INT32 code, VOID* v)
 {
     ADDRINT rtn_address;
@@ -1769,13 +1822,6 @@ VOID Fini(INT32 code, VOID* v)
         cerr << "ERROR, can't open file: " << branch_profile << endl;
         return;
     }
-
-    /*std::multimap<UINT32, branch_data> sorted_loops_map;
-
-    for (std::map<ADDRINT, branch_data>::const_iterator it = branches.begin(); it != branches.end(); ++it)
-    {
-        sorted_loops_map.insert(std::pair<UINT32, branch_data>(it->second.count_seen * -1, it->second));
-    }*/
 
     for (auto &it : branches)
     {
