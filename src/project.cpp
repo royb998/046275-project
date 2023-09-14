@@ -38,7 +38,7 @@ using std::ofstream;
 /* ===================================================================== */
 
 const float HOT_BRANCH_THRESH = 0.6;
-const float HOT_CALL_THRESH = 0.6;
+const float HOT_CALL_THRESH = 0.8;
 const int HOT_CALL_MIN_COUNT = 2;
 
 const std::string branch_profile = "branch-count.csv";
